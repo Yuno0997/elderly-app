@@ -1,0 +1,12 @@
+ngrok.token
+ngrok.generated.yml
+ngrok_upstream_port.txt
+.env
+.env.local
+.env.*.local
+node_modules/
+build/
+dist/
+*.log
+.DS_Store
+Thumbs.db

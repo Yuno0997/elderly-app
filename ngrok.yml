@@ -1,0 +1,10 @@
+# Reference copy of the ngrok v3 shape. start-app.bat runs scripts/write-ngrok-config.ps1
+# to emit ngrok.generated.yml (upstream port from ngrok_upstream_port.txt, default 80).
+# 502 via ngrok = Apache not listening on that port — start Apache in XAMPP first.
+version: 3
+
+endpoints:
+  - name: elderly-app
+    url: https://
+    upstream:
+      url: http://127.0.0.1:80
