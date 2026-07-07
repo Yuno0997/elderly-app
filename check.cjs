@@ -1,0 +1,1 @@
+const fs = require('fs'); const content = fs.readFileSync('./src/components/Residents.tsx', 'utf-8'); const start = content.indexOf('function normalizeResident'); const end = content.indexOf('}', start + 1000); console.log(content.slice(start, end + 1));

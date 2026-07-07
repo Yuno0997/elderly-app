@@ -40,22 +40,40 @@ type MedicationRow = {
 };
 
 function buildReportData(resident: any, incidents: IncidentRow[], medications: MedicationRow[]) {
-  const avgHR = Math.round(resident?.heartRate || 72);
-  const unusualPulseAlerts = incidents.filter((i) => /hr|pulse/i.test(i.type)).length;
+  const avgHR = Math.round(resident?.heartRate || 0);
+  const unusualPulseAlerts = incidents.filter((i) => /hr|pulse|heart/i.test(i.type)).length;
   const sleepAnomalyCount = incidents.filter((i) => /sleep/i.test(i.type)).length;
+  const fallsCount = incidents.filter((i) => /fall/i.test(i.type)).length;
+
+  const incidentCounts = incidents.reduce((acc, inc) => {
+    acc[inc.type] = (acc[inc.type] || 0) + 1;
+    return acc;
+  }, {} as Record<string, number>);
+
+  const incidentByType = Object.entries(incidentCounts).map(([type, count], i) => {
+    const colors = ['#ef4444', '#f59e0b', '#8b5cf6', '#64748b', '#3b82f6'];
+    return { type, count, color: colors[i % colors.length] };
+  });
+
+  if (incidentByType.length === 0) {
+    incidentByType.push({ type: 'No Incidents', count: 1, color: '#e2e8f0' });
+  }
+
+  // Real medication compliance from live data
+  const totalDoses   = medications.length;
+  const givenDoses   = medications.filter(m => m.completed > 0).length;
+  const compliancePct = totalDoses > 0 ? Math.round((givenDoses / totalDoses) * 100) : null;
+  const complianceStr = compliancePct !== null ? `${compliancePct}%` : 'N/A';
+  const complianceSub = totalDoses > 0 ? `${givenDoses} of ${totalDoses} doses` : 'No medication records';
+
   return {
     healthSummary: {
-      avgHR,
-      highestPulse: avgHR + 15,
-      lowestPulse: Math.max(avgHR - 15, 40),
-      latestPulse: avgHR,
-      latestStatus: 'Stable',
+      avgHR: avgHR > 0 ? avgHR : null,
       unusualPulseAlerts,
-      avgSleepDuration: 'N/A',
       sleepAnomalyCount,
       generalRemarks: incidents.length
-        ? 'Report is generated from live incidents and medication records in the backend.'
-        : 'No live incident records found for this resident in the selected period.',
+        ? 'Report is generated from live incidents and medication records. Please review the incident history for specific events.'
+        : 'No live incident records found for this resident in the selected period. Patient monitoring continues as normal.',
     },
     incidents,
     medications,
@@ -66,32 +84,15 @@ function buildReportData(resident: any, incidents: IncidentRow[], medications: M
           note: n.content || '',
         }))
       : [],
-    pulseTrend: [
-      { day: 'Mar 4', avg: 71, high: 89, low: 57 },
-      { day: 'Mar 5', avg: 79, high: 118, low: 60 },
-      { day: 'Mar 6', avg: 70, high: 85, low: 55 },
-      { day: 'Mar 7', avg: 72, high: 90, low: 58 },
-      { day: 'Mar 8', avg: 69, high: 82, low: 54 },
-      { day: 'Mar 9', avg: 74, high: 91, low: 60 },
-      { day: 'Mar 10', avg: 73, high: 95, low: 59 },
-    ],
-    incidentByType: [
-      { type: 'Falls', count: 2, color: '#ef4444' },
-      { type: 'HR High', count: 2, color: '#f59e0b' },
-      { type: 'Sleep', count: 1, color: '#8b5cf6' },
-      { type: 'HR Low', count: 0, color: '#64748b' },
-    ],
-    sleepTrend: [
-      { day: 'Mon', hours: 5.5, anomaly: 0 },
-      { day: 'Tue', hours: 6.8, anomaly: 0 },
-      { day: 'Wed', hours: 6.2, anomaly: 0 },
-      { day: 'Thu', hours: 4.9, anomaly: 1 },
-      { day: 'Fri', hours: 7.1, anomaly: 0 },
-      { day: 'Sat', hours: 6.5, anomaly: 0 },
-      { day: 'Sun', hours: 6.0, anomaly: 0 },
-    ],
-    reportHistory: [],
-    familyRequests: [],
+    // No fake trend data — charts show live incident counts only
+    pulseTrend: [] as any[],
+    sleepTrend: [] as any[],
+    incidentByType,
+    complianceStr,
+    complianceSub,
+    fallsCount,
+    reportHistory: [] as any[],
+    familyRequests: [] as any[],
   };
 }
 
@@ -167,10 +168,21 @@ export function ResidentReport({ resident, userRole, onClose }: ResidentReportPr
   }, [resident.name]);
 
   const data = buildReportData(resident, liveIncidents, liveMeds);
-  const generatedAt = 'April 3, 2026 · 10:45 AM';
-  const period = dateRange === 'Daily' ? 'April 3, 2026' :
-    dateRange === 'Weekly' ? 'Mar 28 – Apr 3, 2026' :
-    dateRange === 'Monthly' ? 'March 2026' : 'Custom Range';
+  const now = new Date();
+  const generatedAt = `${formatPHDate(now)} · ${formatPHTime(now)}`;
+  
+  const getPeriodString = () => {
+    if (dateRange === 'Daily') return formatPHDate(now);
+    if (dateRange === 'Weekly') {
+      const lastWeek = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+      return `${formatPHDate(lastWeek)} – ${formatPHDate(now)}`;
+    }
+    if (dateRange === 'Monthly') {
+      return now.toLocaleString('en-US', { month: 'long', year: 'numeric' });
+    }
+    return 'Custom Range';
+  };
+  const period = getPeriodString();
 
   const toggleCategory = (id: string) => {
     setSelectedCategories(prev =>
@@ -198,9 +210,9 @@ export function ResidentReport({ resident, userRole, onClose }: ResidentReportPr
   const criticalFalls = data.incidents.filter(i => i.type === 'Fall Detected' && i.severity === 'critical').length;
 
   return (
-    <div className="fixed inset-0 z-[60] bg-slate-100 flex flex-col overflow-hidden">
+    <div className="fixed inset-0 z-[60] bg-slate-100 flex flex-col overflow-hidden print:static print:h-auto print:overflow-visible print:bg-white">
       {/* ─── Top Bar ───────────────────────────────────────────────────── */}
-      <div className="bg-white border-b border-slate-200 px-6 py-3 flex-shrink-0 shadow-sm">
+      <div className="bg-white border-b border-slate-200 px-6 py-3 flex-shrink-0 shadow-sm print:hidden">
         <div className="flex items-center justify-between">
           {/* Breadcrumb */}
           <div className="flex items-center gap-1.5 text-sm text-slate-500">
@@ -248,14 +260,14 @@ export function ResidentReport({ resident, userRole, onClose }: ResidentReportPr
       </div>
 
       {/* ─── Main Content ──────────────────────────────────────────────── */}
-      <div className="flex-1 overflow-auto">
-        <div className="max-w-7xl mx-auto p-6 flex gap-6">
+      <div className="flex-1 overflow-auto print:overflow-visible">
+        <div className="max-w-7xl mx-auto p-6 flex gap-6 print:block print:p-0">
 
           {/* ══ LEFT: Main Report Area ══════════════════════════════════ */}
-          <div className="flex-1 min-w-0 flex flex-col gap-5">
+          <div className="flex-1 min-w-0 flex flex-col gap-5 print:block">
 
             {/* Page Title */}
-            <div className="flex items-start justify-between">
+            <div className="flex items-start justify-between print:hidden">
               <div>
                 <div className="flex items-center gap-3 mb-1">
                   <h1 className="text-xl font-bold text-slate-900">Individual Resident Report</h1>
@@ -268,12 +280,12 @@ export function ResidentReport({ resident, userRole, onClose }: ResidentReportPr
               </div>
               <div className="text-right flex-shrink-0">
                 <div className="text-xs text-slate-400">Last updated</div>
-                <div className="text-xs font-medium text-slate-600">April 2026</div>
+                <div className="text-xs font-medium text-slate-600">{now.toLocaleString('en-US', { month: 'long', year: 'numeric' })}</div>
               </div>
             </div>
 
             {/* ── Resident Summary Card ── */}
-            <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+            <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden print:hidden">
               <div className="bg-gradient-to-r from-blue-600 to-teal-500 px-5 py-4 flex items-center gap-5">
                 <div className="w-16 h-16 bg-white/20 rounded-full flex items-center justify-center text-xl font-bold text-white border-2 border-white/40 flex-shrink-0">
                   {resident.name.split(' ').map((n: string) => n[0]).join('').slice(0, 2)}
@@ -318,7 +330,7 @@ export function ResidentReport({ resident, userRole, onClose }: ResidentReportPr
             </div>
 
             {/* ── Filter & Generation Controls ── */}
-            <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-5">
+            <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-5 print:hidden">
               <div className="flex flex-wrap gap-4 items-start">
                 {/* Quick range */}
                 <div className="flex-shrink-0">
@@ -411,9 +423,9 @@ export function ResidentReport({ resident, userRole, onClose }: ResidentReportPr
 
             {/* ── Printable Report Preview ── */}
             {generated && (
-              <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+              <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden print:border-none print:shadow-none print:m-0 print:p-0">
                 {/* Preview header label */}
-                <div className="flex items-center justify-between px-5 py-3 bg-slate-50 border-b border-slate-200">
+                <div className="flex items-center justify-between px-5 py-3 bg-slate-50 border-b border-slate-200 print:hidden">
                   <div className="flex items-center gap-2">
                     <FileText className="w-4 h-4 text-slate-500" />
                     <span className="text-sm font-semibold text-slate-700">Printable Report Preview</span>
@@ -456,7 +468,7 @@ export function ResidentReport({ resident, userRole, onClose }: ResidentReportPr
                         { label: 'Sex / Gender', value: resident.gender },
                         { label: 'Room / Bed Number', value: `${resident.room} · ${resident.section}` },
                         { label: 'Assigned Caregiver', value: resident.caregiver },
-                        { label: 'Attending Physician', value: 'Dr. Michael Chen' },
+                        { label: 'Attending Physician', value: resident.doctor || 'Not assigned' },
                         { label: 'Relative / Guardian', value: resident.emergency?.split(' ·')[0] ?? 'N/A' },
                         { label: 'Contact Information', value: resident.emergency?.split('·')[1]?.trim() ?? 'N/A' },
                         { label: 'Device ID / Band ID', value: resident.deviceId, mono: true },
@@ -477,15 +489,11 @@ export function ResidentReport({ resident, userRole, onClose }: ResidentReportPr
                     <ReportSection label="B" title="Health Monitoring Summary" icon={Heart} iconColor="text-red-500" bgColor="bg-red-50">
                       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-5">
                         {[
-                          { label: 'Average Heart Rate', value: `${data.healthSummary.avgHR} bpm`, color: 'text-slate-900' },
-                          { label: 'Highest Pulse', value: `${data.healthSummary.highestPulse} bpm`, color: 'text-red-600' },
-                          { label: 'Lowest Pulse', value: `${data.healthSummary.lowestPulse} bpm`, color: 'text-blue-600' },
-                          { label: 'Latest Reading', value: `${data.healthSummary.latestPulse} bpm`, color: 'text-green-600' },
-                          { label: 'Monitoring Status', value: data.healthSummary.latestStatus, color: 'text-green-600' },
-                          { label: 'Unusual Pulse Alerts', value: `${data.healthSummary.unusualPulseAlerts} events`, color: 'text-amber-600' },
-                          { label: 'Avg Sleep Duration', value: data.healthSummary.avgSleepDuration, color: 'text-indigo-600' },
-                          { label: 'Sleep Anomaly Count', value: `${data.healthSummary.sleepAnomalyCount} anomaly`, color: 'text-purple-600' },
-                        ].map((item, i) => (
+                        { label: 'Average Heart Rate', value: data.healthSummary.avgHR ? `${data.healthSummary.avgHR} bpm` : 'No data', color: 'text-slate-900' },
+                        { label: 'Unusual Pulse Alerts', value: `${data.healthSummary.unusualPulseAlerts} events`, color: 'text-amber-600' },
+                        { label: 'Sleep Anomaly Count', value: `${data.healthSummary.sleepAnomalyCount} anomaly`, color: 'text-purple-600' },
+                        { label: 'Total Incidents', value: `${data.incidents.length} events`, color: data.incidents.length > 0 ? 'text-red-600' : 'text-green-600' },
+                      ].map((item, i) => (
                           <div key={i} className="bg-slate-50 rounded-lg p-3 border border-slate-100">
                             <div className="text-xs text-slate-400 mb-1">{item.label}</div>
                             <div className={`text-sm font-semibold ${item.color}`}>{item.value}</div>
@@ -608,8 +616,8 @@ export function ResidentReport({ resident, userRole, onClose }: ResidentReportPr
                     <div className="grid grid-cols-3 gap-3 mb-5">
                       {[
                         { label: 'Total Incidents', value: data.incidents.length, sub: 'Reporting period', color: 'bg-red-50 border-red-100 text-red-700' },
-                        { label: 'Medications Compliance', value: '90.3%', sub: '84 of 90 doses', color: 'bg-green-50 border-green-100 text-green-700' },
-                        { label: 'Avg Pulse (7-day)', value: `${data.healthSummary.avgHR} bpm`, sub: 'Within normal range', color: 'bg-blue-50 border-blue-100 text-blue-700' },
+                        { label: 'Medications Compliance', value: data.complianceStr, sub: data.complianceSub, color: 'bg-green-50 border-green-100 text-green-700' },
+                        { label: 'Avg Pulse', value: data.healthSummary.avgHR ? `${data.healthSummary.avgHR} bpm` : 'N/A', sub: data.healthSummary.avgHR ? 'Live reading' : 'No band data', color: 'bg-blue-50 border-blue-100 text-blue-700' },
                       ].map((stat, i) => (
                         <div key={i} className={`rounded-lg border p-3 ${stat.color}`}>
                           <div className="text-sm font-semibold">{stat.label}</div>
@@ -620,40 +628,31 @@ export function ResidentReport({ resident, userRole, onClose }: ResidentReportPr
                     </div>
 
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-                      {/* Pulse Trend */}
+                      {/* Pulse Trend — shows only when real data exists */}
                       <div>
                         <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-3 flex items-center gap-1.5">
                           <Heart className="w-3.5 h-3.5 text-red-400" />
                           Pulse Rate Trend (7-Day)
                         </div>
-                        <div className="h-44">
-                          <ResponsiveContainer width="100%" height="100%">
-                            <LineChart data={data.pulseTrend} margin={{ top: 5, right: 10, left: -20, bottom: 5 }}>
-                              <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
-                              <XAxis dataKey="day" tick={{ fontSize: 10, fill: '#94a3b8' }} />
-                              <YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} domain={[40, 130]} />
-                              <Tooltip
-                                contentStyle={{ fontSize: 11, borderRadius: 8, border: '1px solid #e2e8f0' }}
-                                formatter={(v: any) => [`${v} bpm`]}
-                              />
-                              <Line type="monotone" dataKey="avg" stroke="#3b82f6" strokeWidth={2} dot={{ r: 3 }} name="Avg" />
-                              <Line type="monotone" dataKey="high" stroke="#ef4444" strokeWidth={1.5} strokeDasharray="4 2" dot={false} name="High" />
-                              <Line type="monotone" dataKey="low" stroke="#64748b" strokeWidth={1.5} strokeDasharray="4 2" dot={false} name="Low" />
-                            </LineChart>
-                          </ResponsiveContainer>
-                        </div>
-                        <div className="flex items-center justify-center gap-4 mt-1">
-                          {[
-                            { color: '#3b82f6', label: 'Avg' },
-                            { color: '#ef4444', label: 'High' },
-                            { color: '#64748b', label: 'Low' },
-                          ].map(l => (
-                            <span key={l.label} className="flex items-center gap-1 text-xs text-slate-500">
-                              <span className="w-3 h-0.5 inline-block rounded" style={{ backgroundColor: l.color }} />
-                              {l.label}
-                            </span>
-                          ))}
-                        </div>
+                        {data.pulseTrend.length > 0 ? (
+                          <div className="h-44">
+                            <ResponsiveContainer width="100%" height="100%">
+                              <LineChart data={data.pulseTrend} margin={{ top: 5, right: 10, left: -20, bottom: 5 }}>
+                                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
+                                <XAxis dataKey="day" tick={{ fontSize: 10, fill: '#94a3b8' }} />
+                                <YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} domain={[40, 130]} />
+                                <Tooltip contentStyle={{ fontSize: 11, borderRadius: 8, border: '1px solid #e2e8f0' }} formatter={(v: any) => [`${v} bpm`]} />
+                                <Line type="monotone" dataKey="avg" stroke="#3b82f6" strokeWidth={2} dot={{ r: 3 }} name="Avg" />
+                                <Line type="monotone" dataKey="high" stroke="#ef4444" strokeWidth={1.5} strokeDasharray="4 2" dot={false} name="High" />
+                                <Line type="monotone" dataKey="low" stroke="#64748b" strokeWidth={1.5} strokeDasharray="4 2" dot={false} name="Low" />
+                              </LineChart>
+                            </ResponsiveContainer>
+                          </div>
+                        ) : (
+                          <div className="h-44 flex items-center justify-center rounded-lg border border-dashed border-slate-200 bg-slate-50">
+                            <p className="text-sm text-slate-400">No historical pulse trend data available</p>
+                          </div>
+                        )}
                       </div>
 
                       {/* Incident Count by Type */}
@@ -682,39 +681,33 @@ export function ResidentReport({ resident, userRole, onClose }: ResidentReportPr
                         </div>
                       </div>
 
-                      {/* Sleep Anomaly Frequency */}
+                      {/* Sleep Anomaly — shows only when real data exists */}
                       <div className="md:col-span-2">
                         <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-3 flex items-center gap-1.5">
                           <Moon className="w-3.5 h-3.5 text-indigo-400" />
-                          Sleep Duration & Anomaly Frequency (Weekly)
+                          Sleep Anomaly Records (Weekly)
                         </div>
-                        <div className="h-40">
-                          <ResponsiveContainer width="100%" height="100%">
-                            <BarChart data={data.sleepTrend} margin={{ top: 5, right: 10, left: -20, bottom: 5 }}>
-                              <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
-                              <XAxis dataKey="day" tick={{ fontSize: 10, fill: '#94a3b8' }} />
-                              <YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} domain={[0, 9]} />
-                              <Tooltip
-                                contentStyle={{ fontSize: 11, borderRadius: 8, border: '1px solid #e2e8f0' }}
-                              />
-                              <Bar dataKey="hours" name="Sleep Hours" fill="#818cf8" radius={[4, 4, 0, 0]} opacity={0.85}>
-                                {data.sleepTrend.map((entry, i) => (
-                                  <Cell key={i} fill={entry.anomaly ? '#7c3aed' : '#818cf8'} />
-                                ))}
-                              </Bar>
-                            </BarChart>
-                          </ResponsiveContainer>
-                        </div>
-                        <div className="flex items-center justify-center gap-4 mt-1">
-                          <span className="flex items-center gap-1.5 text-xs text-slate-500">
-                            <span className="w-3 h-3 bg-indigo-400 rounded-sm inline-block" />
-                            Normal Night
-                          </span>
-                          <span className="flex items-center gap-1.5 text-xs text-slate-500">
-                            <span className="w-3 h-3 bg-violet-700 rounded-sm inline-block" />
-                            Sleep Anomaly Detected
-                          </span>
-                        </div>
+                        {data.sleepTrend.length > 0 ? (
+                          <div className="h-40">
+                            <ResponsiveContainer width="100%" height="100%">
+                              <BarChart data={data.sleepTrend} margin={{ top: 5, right: 10, left: -20, bottom: 5 }}>
+                                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
+                                <XAxis dataKey="day" tick={{ fontSize: 10, fill: '#94a3b8' }} />
+                                <YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} domain={[0, 9]} />
+                                <Tooltip contentStyle={{ fontSize: 11, borderRadius: 8, border: '1px solid #e2e8f0' }} />
+                                <Bar dataKey="hours" name="Sleep Hours" fill="#818cf8" radius={[4, 4, 0, 0]} opacity={0.85}>
+                                  {data.sleepTrend.map((entry, i) => (
+                                    <Cell key={i} fill={entry.anomaly ? '#7c3aed' : '#818cf8'} />
+                                  ))}
+                                </Bar>
+                              </BarChart>
+                            </ResponsiveContainer>
+                          </div>
+                        ) : (
+                          <div className="h-40 flex items-center justify-center rounded-lg border border-dashed border-slate-200 bg-slate-50">
+                            <p className="text-sm text-slate-400">No historical sleep data available — {data.healthSummary.sleepAnomalyCount} sleep anomaly alert(s) recorded</p>
+                          </div>
+                        )}
                       </div>
                     </div>
                   </ReportSection>
@@ -758,7 +751,7 @@ export function ResidentReport({ resident, userRole, onClose }: ResidentReportPr
           </div>
 
           {/* ══ RIGHT: Utility Sidebar ══════════════════════════════════ */}
-          <div className="w-64 flex-shrink-0 flex flex-col gap-4">
+          <div className="w-64 flex-shrink-0 flex flex-col gap-4 print:hidden">
 
             {/* Quick Export */}
             <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4">

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
+  Activity,
   Calendar,
   Check,
   ChevronDown,
@@ -90,6 +91,14 @@ export function SystemManagement() {
   const [facilityName, setFacilityName] = useState('Sunrise Senior Care');
   const [facilityId, setFacilityId] = useState('SCF-2024');
   const [savingFacility, setSavingFacility] = useState(false);
+  const [sleepWindowStart, setSleepWindowStart] = useState(21);
+  const [sleepWindowEnd, setSleepWindowEnd] = useState(6);
+  const [savingSleepWindow, setSavingSleepWindow] = useState(false);
+  const [hrWarnLow,  setHrWarnLow]  = useState(60);
+  const [hrWarnHigh, setHrWarnHigh] = useState(100);
+  const [hrCritLow,  setHrCritLow]  = useState(45);
+  const [hrCritHigh, setHrCritHigh] = useState(130);
+  const [savingHrThresholds, setSavingHrThresholds] = useState(false);
   const [newTask, setNewTask] = useState({
     caregiverUserId: '',
     residentIds: [] as number[],
@@ -189,9 +198,43 @@ export function SystemManagement() {
         // ignore
       }
     })();
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await apiFetch('/api/settings/sleep-window');
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        if (cancelled) return;
+        setSleepWindowStart(Number(data?.startHour ?? 21));
+        setSleepWindowEnd(Number(data?.endHour ?? 6));
+      } catch {
+        // ignore
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await apiFetch('/api/settings/hr-thresholds');
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        if (cancelled) return;
+        setHrWarnLow(Number(data?.warnLow  ?? 60));
+        setHrWarnHigh(Number(data?.warnHigh ?? 100));
+        setHrCritLow(Number(data?.critLow  ?? 45));
+        setHrCritHigh(Number(data?.critHigh ?? 130));
+      } catch {
+        // ignore
+      }
+    })();
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
@@ -542,8 +585,64 @@ export function SystemManagement() {
     }
   };
 
+  const handleSaveHrThresholds = async () => {
+    if (hrCritLow >= hrWarnLow) {
+      setError('Critical low HR must be less than warning low HR.');
+      return;
+    }
+    if (hrWarnLow >= hrWarnHigh) {
+      setError('Warning low HR must be less than warning high HR.');
+      return;
+    }
+    if (hrWarnHigh >= hrCritHigh) {
+      setError('Warning high HR must be less than critical high HR.');
+      return;
+    }
+    try {
+      setSavingHrThresholds(true);
+      setError('');
+      const res = await apiFetch('/api/settings/hr-thresholds', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ warnLow: hrWarnLow, warnHigh: hrWarnHigh, critLow: hrCritLow, critHigh: hrCritHigh }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data?.error || 'Failed to save HR thresholds');
+        return;
+      }
+      showToast('HR thresholds saved — hardware will sync via Firebase');
+    } catch (e: any) {
+      setError(e?.message || 'Failed to save HR thresholds');
+    } finally {
+      setSavingHrThresholds(false);
+    }
+  };
+
+  const handleSaveSleepWindow = async () => {
+    try {
+      setSavingSleepWindow(true);
+      setError('');
+      const res = await apiFetch('/api/settings/sleep-window', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ startHour: sleepWindowStart, endHour: sleepWindowEnd }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data?.error || 'Failed to save sleep window');
+        return;
+      }
+      showToast('Sleep window saved — hardware will sync via Firebase');
+    } catch (e: any) {
+      setError(e?.message || 'Failed to save sleep window');
+    } finally {
+      setSavingSleepWindow(false);
+    }
+  };
+
   return (
-    <div className="p-4 md:p-6 max-w-5xl mx-auto space-y-6">
+    <div className="p-4 md:p-6 space-y-6">
       <div>
         <div className="flex items-start justify-between gap-3">
           <div>
@@ -603,6 +702,163 @@ export function SystemManagement() {
             className="mt-3 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 disabled:opacity-60"
           >
             {savingFacility ? 'Saving...' : 'Save Facility Settings'}
+          </button>
+        </div>
+      </div>
+
+      {/* Sleep Monitoring Window */}
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+        <div className="p-5 border-b border-slate-100">
+          <div className="font-semibold text-slate-900 flex items-center gap-2">
+            <Clock className="w-4 h-4 text-indigo-600" />
+            Sleep Monitoring Window
+          </div>
+          <div className="text-sm text-slate-500 mt-0.5">
+            Set the daily sleep window for elder monitoring. The hardware reads this from Firebase automatically.
+          </div>
+        </div>
+        <div className="p-5 bg-slate-50">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">🌙 Sleep Start (bedtime)</label>
+              <select
+                value={sleepWindowStart}
+                onChange={(e) => setSleepWindowStart(Number(e.target.value))}
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white"
+              >
+                {Array.from({ length: 24 }, (_, h) => (
+                  <option key={h} value={h}>
+                    {h === 0 ? '12:00 AM (Midnight)' : h < 12 ? `${h}:00 AM` : h === 12 ? '12:00 PM (Noon)' : `${h - 12}:00 PM`}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">☀️ Sleep End (wake time)</label>
+              <select
+                value={sleepWindowEnd}
+                onChange={(e) => setSleepWindowEnd(Number(e.target.value))}
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white"
+              >
+                {Array.from({ length: 24 }, (_, h) => (
+                  <option key={h} value={h}>
+                    {h === 0 ? '12:00 AM (Midnight)' : h < 12 ? `${h}:00 AM` : h === 12 ? '12:00 PM (Noon)' : `${h - 12}:00 PM`}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+          <div className="mt-3 text-xs text-slate-500 bg-indigo-50 border border-indigo-100 rounded-lg px-3 py-2">
+            Current window: <strong>
+              {sleepWindowStart === 0 ? '12:00 AM' : sleepWindowStart < 12 ? `${sleepWindowStart}:00 AM` : sleepWindowStart === 12 ? '12:00 PM' : `${sleepWindowStart - 12}:00 PM`}
+            </strong> → <strong>
+              {sleepWindowEnd === 0 ? '12:00 AM' : sleepWindowEnd < 12 ? `${sleepWindowEnd}:00 AM` : sleepWindowEnd === 12 ? '12:00 PM' : `${sleepWindowEnd - 12}:00 PM`}
+            </strong>
+          </div>
+          <button
+            type="button"
+            onClick={handleSaveSleepWindow}
+            disabled={savingSleepWindow}
+            className="mt-3 px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700 disabled:opacity-60 flex items-center gap-2"
+          >
+            <Save className="w-4 h-4" />
+            {savingSleepWindow ? 'Saving...' : 'Save Sleep Window'}
+          </button>
+        </div>
+      </div>
+
+      {/* HR Adaptive Threshold */}
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+        <div className="p-5 border-b border-slate-100">
+          <div className="font-semibold text-slate-900 flex items-center gap-2">
+            <Activity className="w-4 h-4 text-rose-600" />
+            HR Adaptive Thresholds
+          </div>
+          <div className="text-sm text-slate-500 mt-0.5">
+            Set warning and critical heart-rate limits for unusual-pulse detection. The hardware reads these from Firebase automatically.
+          </div>
+        </div>
+        <div className="p-5 bg-slate-50 space-y-4">
+          {/* Visual threshold ladder */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">
+                <span className="inline-block w-2 h-2 rounded-full bg-red-600 mr-1"></span>
+                Critical Low (bpm)
+              </label>
+              <input
+                type="number"
+                min={20} max={199}
+                value={hrCritLow}
+                onChange={(e) => setHrCritLow(Number(e.target.value))}
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white"
+              />
+              <p className="text-[11px] text-slate-400 mt-0.5">Severe bradycardia</p>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">
+                <span className="inline-block w-2 h-2 rounded-full bg-amber-400 mr-1"></span>
+                Warning Low (bpm)
+              </label>
+              <input
+                type="number"
+                min={21} max={200}
+                value={hrWarnLow}
+                onChange={(e) => setHrWarnLow(Number(e.target.value))}
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white"
+              />
+              <p className="text-[11px] text-slate-400 mt-0.5">Mild bradycardia</p>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">
+                <span className="inline-block w-2 h-2 rounded-full bg-amber-400 mr-1"></span>
+                Warning High (bpm)
+              </label>
+              <input
+                type="number"
+                min={21} max={249}
+                value={hrWarnHigh}
+                onChange={(e) => setHrWarnHigh(Number(e.target.value))}
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white"
+              />
+              <p className="text-[11px] text-slate-400 mt-0.5">Mild tachycardia</p>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">
+                <span className="inline-block w-2 h-2 rounded-full bg-red-600 mr-1"></span>
+                Critical High (bpm)
+              </label>
+              <input
+                type="number"
+                min={22} max={250}
+                value={hrCritHigh}
+                onChange={(e) => setHrCritHigh(Number(e.target.value))}
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white"
+              />
+              <p className="text-[11px] text-slate-400 mt-0.5">Severe tachycardia</p>
+            </div>
+          </div>
+
+          {/* Visual range bar */}
+          <div className="mt-1 text-xs text-slate-500 bg-rose-50 border border-rose-100 rounded-lg px-3 py-2">
+            Current range: <strong className="text-red-600">{hrCritLow}</strong>
+            <span className="text-slate-400"> → </span>
+            <strong className="text-amber-500">{hrWarnLow}</strong>
+            <span className="text-green-600 font-medium"> ✓ Normal </span>
+            <strong className="text-amber-500">{hrWarnHigh}</strong>
+            <span className="text-slate-400"> → </span>
+            <strong className="text-red-600">{hrCritHigh}</strong>
+            <span className="text-slate-400 ml-1">bpm</span>
+          </div>
+
+          <button
+            type="button"
+            onClick={handleSaveHrThresholds}
+            disabled={savingHrThresholds}
+            className="mt-1 px-4 py-2 bg-rose-600 text-white rounded-lg text-sm hover:bg-rose-700 disabled:opacity-60 flex items-center gap-2"
+          >
+            <Save className="w-4 h-4" />
+            {savingHrThresholds ? 'Saving...' : 'Save HR Thresholds'}
           </button>
         </div>
       </div>

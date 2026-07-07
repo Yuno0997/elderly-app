@@ -45,7 +45,7 @@ export function Devices({ userRole }: DevicesProps) {
   const [devices, setDevices] = useState<any[]>([]);
   const [residents, setResidents] = useState<Array<{ id: number; name: string; room: string }>>([]);
   const [loading, setLoading] = useState(true);
-  const [deviceId, setDeviceId] = useState('');
+  const [deviceId, setDeviceId] = useState('SAFEBAND-001');
   const [status, setStatus] = useState<'online' | 'offline' | 'maintenance'>('online');
   const [battery, setBattery] = useState(100);
   const [assigningDeviceId, setAssigningDeviceId] = useState<string | null>(null);
@@ -73,7 +73,19 @@ export function Devices({ userRole }: DevicesProps) {
   };
 
   useEffect(() => {
-    loadDevices();
+    void loadDevices();
+    const iv = setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      void loadDevices();
+    }, 3000);
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void loadDevices();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      clearInterval(iv);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, []);
 
   useEffect(() => {
@@ -113,7 +125,7 @@ export function Devices({ userRole }: DevicesProps) {
     if (!res.ok) return;
     const created = await res.json();
     setDevices((prev) => [created, ...prev]);
-    setDeviceId('');
+    setDeviceId('SAFEBAND-001');
     setStatus('online');
     setBattery(100);
   };
@@ -134,8 +146,8 @@ export function Devices({ userRole }: DevicesProps) {
   };
 
   return (
-    <div className="p-4 md:p-6">
-      <div className="bg-white rounded-lg shadow-sm border border-slate-200">
+    <div className="p-4 md:p-6 min-h-full flex flex-col">
+      <div className="bg-white rounded-lg shadow-sm border border-slate-200 flex-1 flex flex-col">
         {/* Header */}
         <div className="p-4 border-b border-slate-200">
           <div className="flex items-center justify-between mb-4">
@@ -191,7 +203,7 @@ export function Devices({ userRole }: DevicesProps) {
           ) : filtered.length === 0 ? (
             <div className="p-10 text-center text-slate-400">
               <Cpu className="w-12 h-12 mx-auto mb-3 text-slate-300" />
-              <p className="text-sm">No devices found.</p>
+              <p className="text-sm">No devices found yet. The band will appear automatically once live data is detected.</p>
             </div>
           ) : (
             <div className="space-y-2">

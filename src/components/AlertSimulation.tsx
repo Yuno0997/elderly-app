@@ -20,7 +20,7 @@ const SCENARIOS: Array<{
 ];
 
 export function AlertSimulation({ currentUserId }: { currentUserId: string }) {
-  const [scenario, setScenario] = useState<Scenario>('fall');
+  const [scenarios, setScenarios] = useState<Scenario[]>([]);
   const [target, setTarget] = useState<Target>('caregiver');
   const [selectedCaregiverIds, setSelectedCaregiverIds] = useState<string[]>([]);
   const [selectedAdminIds, setSelectedAdminIds] = useState<string[]>([]);
@@ -128,6 +128,10 @@ export function AlertSimulation({ currentUserId }: { currentUserId: string }) {
 
   const simulate = async () => {
     setError('');
+    if (scenarios.length === 0) {
+      setError('Please select at least one alert.');
+      return;
+    }
     if (target === 'caregiver' && selectedCaregiverIds.length === 0) {
       setError('Select at least one caregiver first.');
       return;
@@ -137,30 +141,35 @@ export function AlertSimulation({ currentUserId }: { currentUserId: string }) {
       return;
     }
     setBusy(true);
+    let totalCreated = 0;
+    let totalSkipped = 0;
     try {
-      const res = await apiFetch('/api/admin/alert-simulation', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          scenario,
-          target,
-          caregiverUserIds: target === 'caregiver' ? selectedCaregiverIds : undefined,
-          adminUserIds: target === 'admin' ? selectedAdminIds : undefined,
-        }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setError(data?.detail || data?.error || `Failed (HTTP ${res.status}).`);
-        return;
+      for (const scenario of scenarios) {
+        const res = await apiFetch('/api/admin/alert-simulation', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            scenario,
+            target,
+            caregiverUserIds: target === 'caregiver' ? selectedCaregiverIds : undefined,
+            adminUserIds: target === 'admin' ? selectedAdminIds : undefined,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          setError(data?.detail || data?.error || `Failed on ${scenario} (HTTP ${res.status}).`);
+          return;
+        }
+        totalCreated += typeof data?.created === 'number' ? data.created : 0;
+        totalSkipped += typeof data?.skipped === 'number' ? data.skipped : 0;
       }
-      const created = typeof data?.created === 'number' ? data.created : 0;
-      const skipped = typeof data?.skipped === 'number' ? data.skipped : 0;
-      if (created > 0 && skipped > 0) {
+      
+      if (totalCreated > 0 && totalSkipped > 0) {
         playAlertSound();
-        showToast(`Simulation sent (${created}) · skipped ${skipped} caregiver(s) with no residents`);
-      } else if (created > 0) {
+        showToast(`Simulation sent (${totalCreated}) · skipped ${totalSkipped} caregiver(s) with no residents`);
+      } else if (totalCreated > 0) {
         playAlertSound();
-        showToast(`Simulation sent (${created} alert${created === 1 ? '' : 's'})`);
+        showToast(`Simulation sent (${totalCreated} alert${totalCreated === 1 ? '' : 's'})`);
       } else {
         showToast('Already sent recently. Wait 5 seconds, then try again.');
       }
@@ -182,25 +191,28 @@ export function AlertSimulation({ currentUserId }: { currentUserId: string }) {
       return;
     }
     setBusy(true);
+    let totalDeleted = 0;
     try {
-      const res = await apiFetch('/api/admin/alert-simulation/clear', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          // scenario is ignored by the backend for clearing; reuse schema for consistency
-          scenario,
-          target,
-          caregiverUserIds: target === 'caregiver' ? selectedCaregiverIds : undefined,
-          adminUserIds: target === 'admin' ? selectedAdminIds : undefined,
-        }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setError(data?.detail || data?.error || `Failed (HTTP ${res.status}).`);
-        return;
+      const activeScenarios = scenarios.length > 0 ? scenarios : ['fall', 'sleep', 'pulse'];
+      for (const scenario of activeScenarios) {
+        const res = await apiFetch('/api/admin/alert-simulation/clear', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            scenario,
+            target,
+            caregiverUserIds: target === 'caregiver' ? selectedCaregiverIds : undefined,
+            adminUserIds: target === 'admin' ? selectedAdminIds : undefined,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          setError(data?.detail || data?.error || `Failed (HTTP ${res.status}).`);
+          return;
+        }
+        totalDeleted += typeof data?.deleted === 'number' ? data.deleted : 0;
       }
-      const deleted = typeof data?.deleted === 'number' ? data.deleted : 0;
-      showToast(deleted > 0 ? `Cleared ${deleted} simulation alert${deleted === 1 ? '' : 's'}` : 'No simulation alerts to clear');
+      showToast(totalDeleted > 0 ? `Cleared ${totalDeleted} simulation alert${totalDeleted === 1 ? '' : 's'}` : 'No simulation alerts to clear');
     } catch (e: any) {
       setError(e?.message || 'Failed to clear simulation alerts.');
     } finally {
@@ -223,12 +235,12 @@ export function AlertSimulation({ currentUserId }: { currentUserId: string }) {
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           {SCENARIOS.map((s) => {
             const Icon = s.icon;
-            const active = scenario === s.id;
+            const active = scenarios.includes(s.id);
             return (
               <button
                 key={s.id}
                 type="button"
-                onClick={() => setScenario(s.id)}
+                onClick={() => setScenarios(prev => prev.includes(s.id) ? prev.filter(x => x !== s.id) : [...prev, s.id])}
                 className={`text-left rounded-xl border p-3 transition-colors ${
                   active ? 'border-blue-600 ring-2 ring-blue-500/20 bg-blue-50/40' : 'border-slate-200 hover:bg-slate-50'
                 }`}
@@ -404,7 +416,7 @@ export function AlertSimulation({ currentUserId }: { currentUserId: string }) {
               className="inline-flex items-center gap-2 px-4 py-2 bg-rose-600 text-white rounded-lg hover:bg-rose-700 disabled:opacity-60 text-sm font-medium"
             >
               <Send className="w-4 h-4" />
-              {busy ? 'Sending…' : 'Send test alert'}
+              {busy ? 'Sending…' : 'Trigger Selected Alerts'}
             </button>
             <button
               type="button"

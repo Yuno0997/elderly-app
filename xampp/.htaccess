@@ -1,6 +1,9 @@
 <IfModule mod_rewrite.c>
   RewriteEngine On
 
+  # API -> Node on :4000 (needs mod_proxy + mod_proxy_http; prefer global ProxyPass in apache-elderly-app.conf)
+  RewriteRule ^api/(.*)$ http://127.0.0.1:4000/api/$1 [P,L]
+
   # If the requested resource doesn't exist, serve index.html (SPA routing).
   RewriteCond %{REQUEST_FILENAME} !-f
   RewriteCond %{REQUEST_FILENAME} !-d

@@ -20,6 +20,7 @@ import { SleepAnomalyModal } from './components/SleepAnomalyModal';
 import { UnusualPulseModal } from './components/UnusualPulseModal';
 import { SecurityModal } from './components/SecurityModal';
 import { ProfileModal } from './components/ProfileModal';
+import { AlertToastStack } from './components/AlertToastStack';
 import { apiFetch, clearAuthToken, getAuthToken } from './lib/api';
 import { formatPHDateTime } from './lib/time';
 
@@ -48,11 +49,19 @@ function App() {
   const [criticalAlerts, setCriticalAlerts] = useState<any[]>([]);
   const [notifications, setNotifications] = useState<any[]>([]);
   const [showNotifications, setShowNotifications] = useState(false);
-  const [activeCaregiverAlertId, setActiveCaregiverAlertId] = useState<string | null>(null);
+  const [selectedAlertId, setSelectedAlertId] = useState<string | null>(null);
   const [showSecurityModal, setShowSecurityModal] = useState(false);
   const [showProfileModal, setShowProfileModal] = useState(false);
   const seenAlertIdsRef = useRef<Set<string>>(new Set());
   const notificationsInitializedRef = useRef(false);
+  const viewedNotifIdsRef = useRef<Set<string>>(new Set());
+  const [unseenNotifCount, setUnseenNotifCount] = useState(0);
+  const [appToast, setAppToast] = useState('');
+
+  const showAppToast = (msg: string) => {
+    setAppToast(msg);
+    setTimeout(() => setAppToast(''), 3000);
+  };
   const alertAudioCtxRef = useRef<AudioContext | null>(null);
   const alertAudioNodesRef = useRef<{
     o1: OscillatorNode;
@@ -174,6 +183,41 @@ function App() {
     bootstrapAuth();
   }, []);
 
+  // ── Global 401 auto-logout ────────────────────────────────────────────────
+  // apiFetch dispatches 'auth:unauthorized' the moment any protected API call
+  // returns 401. We listen here so polling loops don't keep firing after the
+  // token has expired or been revoked.
+  useEffect(() => {
+    const onUnauthorized = () => {
+      setCurrentUser(null);
+      setCurrentPage('dashboard');
+      setCriticalAlerts([]);
+      setSelectedAlertId(null);
+      stopContinuousAlertSound();
+    };
+    window.addEventListener('auth:unauthorized', onUnauthorized);
+    return () => window.removeEventListener('auth:unauthorized', onUnauthorized);
+  }, []);
+
+  // ── Proactive session heartbeat (every 5 min) ─────────────────────────────
+  // Quietly checks whether the JWT is still valid. If the server says 401,
+  // apiFetch will fire 'auth:unauthorized' above, triggering a clean logout
+  // before the 3-second polling loops start producing a 401 flood.
+  useEffect(() => {
+    if (!currentUser) return;
+    const check = async () => {
+      try {
+        await apiFetch('/api/auth/session');
+        // 401 is handled globally by the auth:unauthorized listener above.
+      } catch {
+        // network error — ignore, keep user logged in
+      }
+    };
+    const iv = setInterval(check, 5 * 60 * 1000); // every 5 minutes
+    return () => clearInterval(iv);
+  }, [currentUser]);
+
+
   useEffect(() => {
     const checkMobile = () => {
       setIsMobile(window.innerWidth < 768);
@@ -183,9 +227,20 @@ function App() {
     return () => window.removeEventListener('resize', checkMobile);
   }, []);
 
-  // Keep online banner tied to actual backend polling behavior.
+  // Keep online banner tied to actual backend health.
+  // Ping /api/health every 30s; show banner if backend is unreachable.
   useEffect(() => {
-    setIsConnected(true);
+    const check = async () => {
+      try {
+        const res = await fetch('/api/health');
+        setIsConnected(res.ok);
+      } catch {
+        setIsConnected(false);
+      }
+    };
+    check();
+    const iv = setInterval(check, 30_000);
+    return () => clearInterval(iv);
   }, []);
 
   // Backend-driven notification polling for admin/caregiver
@@ -258,16 +313,12 @@ function App() {
   }, [currentUser]);
 
   useEffect(() => {
-    // Caregiver flow: show exactly one modal for the newest unacknowledged alert.
+    // Caregiver auto-pop modal effect removed in favor of stacked toasts
     if (!currentUser || currentUser.role !== 'caregiver') {
-      setActiveCaregiverAlertId(null);
+      setSelectedAlertId(null);
       return;
     }
-    const newestSupported = [...notifications]
-      .filter((n: any) => n.status === 'unacknowledged' && /(fall|sleep|hr|pulse)/i.test(String(n.type || '')))
-      .sort((a: any, b: any) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())[0];
-    setActiveCaregiverAlertId(newestSupported?.id ?? null);
-  }, [notifications, currentUser]);
+  }, [currentUser]);
 
   useEffect(() => {
     if (!currentUser || currentUser.role === 'relative') return;
@@ -286,6 +337,10 @@ function App() {
     const hasNewAlert = [...activeAlertIds].some((id) => !seenAlertIdsRef.current.has(id));
     if (hasNewAlert) playIncomingAlertSound();
     seenAlertIdsRef.current = activeAlertIds;
+
+    // Update unseen badge count — only alerts not yet viewed by opening the panel
+    const unseen = [...activeAlertIds].filter((id) => !viewedNotifIdsRef.current.has(id)).length;
+    setUnseenNotifCount(unseen);
   }, [notifications, currentUser]);
 
   useEffect(() => {
@@ -297,7 +352,7 @@ function App() {
       (n: any) =>
         !n.isTaskNotification &&
         n.status === 'unacknowledged' &&
-        /(fall|sleep|hr|pulse|critical)/i.test(String(n.type || '') + ' ' + String(n.severity || ''))
+        /(fall|sleep|restless|spo2|apnea|hr|pulse|tachycardia|bradycardia|heart|critical)/i.test(String(n.type || '') + ' ' + String(n.severity || ''))
     );
 
     if (!hasUnackEmergency) {
@@ -335,7 +390,7 @@ function App() {
     setCurrentUser(null);
     setCurrentPage('dashboard');
     setCriticalAlerts([]);
-    setActiveCaregiverAlertId(null);
+    setSelectedAlertId(null);
   };
 
   const handleNavigate = (page: string) => {
@@ -352,27 +407,78 @@ function App() {
     setNotifications(prev => prev.map(n => n.id === alertId ? { ...n, status: 'acknowledged' } : n));
   };
 
-  const activeCaregiverAlert =
-    currentUser?.role === 'caregiver'
-      ? notifications.find((n: any) => n.id === activeCaregiverAlertId && n.status === 'unacknowledged') ?? null
-      : null;
-  const activeAdminAlert =
-    currentUser?.role === 'admin'
-      ? [...notifications]
-          .filter((n: any) => n.status === 'unacknowledged' && /(fall|sleep|hr|pulse)/i.test(String(n.type || '')))
-          .sort((a: any, b: any) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())[0] ?? null
-      : null;
+  const selectedAlert = selectedAlertId 
+    ? notifications.find((n: any) => n.id === selectedAlertId && n.status === 'unacknowledged') ?? null
+    : null;
+
+  const activeCaregiverAlert = currentUser?.role === 'caregiver' ? selectedAlert : null;
+  const activeAdminAlert = currentUser?.role === 'admin' ? selectedAlert : null;
+
   const activeAdminAlertType = String(activeAdminAlert?.type || '').toLowerCase();
   const activeCaregiverAlertType = String(activeCaregiverAlert?.type || '').toLowerCase();
-  const closeCaregiverAlert = () => setActiveCaregiverAlertId(null);
+  
+  const closeCaregiverAlert = () => setSelectedAlertId(null);
   const acknowledgeCaregiverAlert = async () => {
     if (!activeCaregiverAlert?.id) return;
     await acknowledgeNotification(activeCaregiverAlert.id);
-    setActiveCaregiverAlertId(null);
+    setSelectedAlertId(null);
   };
   const acknowledgeAdminAlert = async () => {
     if (!activeAdminAlert?.id) return;
     await acknowledgeNotification(activeAdminAlert.id);
+    setSelectedAlertId(null);
+  };
+
+  // ── Pulse modal button helpers ────────────────────────────────────────────────
+  const handleViewMonitoring = async (alert: any, closeModal: () => void) => {
+    if (alert?.id) await acknowledgeNotification(alert.id);
+    closeModal();
+    handleNavigate('incident-history');
+  };
+
+  const handleMarkFollowUp = async (alert: any, closeModal: () => void) => {
+    if (!alert?.id) return;
+    // 1. Acknowledge the alert
+    await acknowledgeNotification(alert.id);
+
+    // 2. Auto-create a follow-up care task 30 min from now
+    try {
+      // Resolve assigned caregiver for this resident
+      const residentsRes = await apiFetch('/api/residents');
+      const residents: any[] = residentsRes.ok ? await residentsRes.json() : [];
+      const match = residents.find(
+        (r: any) => String(r.name || '').trim().toLowerCase() === String(alert.resident || '').trim().toLowerCase()
+      );
+      const caregiverUserId = match?.caregiver_user_id ?? null;
+      const residentId = match?.id ?? null;
+
+      const scheduleTime = new Date(Date.now() + 30 * 60 * 1000)
+        .toISOString()
+        .slice(0, 16); // datetime-local format
+
+      if (caregiverUserId && residentId) {
+        await apiFetch('/api/care-tasks', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            caregiverUserId,
+            residentIds: [residentId],
+            taskType: 'Pulse Follow-Up Check',
+            scheduleTime,
+            priority: 'high',
+            notes: `Auto-created follow-up for pulse anomaly alert (${alert.type || 'Unusual Pulse Rate'}) detected at ${alert.timestamp ? new Date(alert.timestamp).toLocaleTimeString() : 'unknown time'}.`,
+          }),
+        });
+        showAppToast(`Follow-up task created for ${alert.resident} — scheduled in 30 min`);
+      } else {
+        showAppToast('Alert marked for follow-up (no caregiver assigned to auto-create task)');
+      }
+    } catch {
+      showAppToast('Alert acknowledged — could not auto-create follow-up task');
+    }
+
+    closeModal();
+    handleNavigate('residents');
   };
 
   if (authChecking) {
@@ -440,8 +546,17 @@ function App() {
   };
 
   return (
-    <div className="h-screen flex flex-col bg-slate-50">
+    <div className="h-screen flex flex-col bg-slate-50 print:h-auto print:block print:bg-white">
       {!isConnected && <ConnectionBanner />}
+
+      {currentUser.role !== 'relative' && (
+        <AlertToastStack
+          notifications={notifications}
+          onViewDetails={(alert) => {
+            setSelectedAlertId(alert.id);
+          }}
+        />
+      )}
 
       {currentUser.role === 'admin' && activeAdminAlert && /fall/i.test(activeAdminAlertType) && (
         <CriticalFallModal
@@ -460,7 +575,7 @@ function App() {
         />
       )}
 
-      {currentUser.role === 'admin' && activeAdminAlert && /sleep/i.test(activeAdminAlertType) && (
+      {currentUser.role === 'admin' && activeAdminAlert && /(sleep|restless|spo2|apnea)/i.test(activeAdminAlertType) && (
         <SleepAnomalyModal
           resident={{
             name: activeAdminAlert.resident || 'Unknown Resident',
@@ -484,7 +599,7 @@ function App() {
         />
       )}
 
-      {currentUser.role === 'admin' && activeAdminAlert && /(hr|pulse)/i.test(activeAdminAlertType) && (
+      {currentUser.role === 'admin' && activeAdminAlert && /(hr|pulse|tachycardia|bradycardia|heart)/i.test(activeAdminAlertType) && (
         <UnusualPulseModal
           resident={{
             name: activeAdminAlert.resident || 'Unknown Resident',
@@ -500,12 +615,12 @@ function App() {
             status: 'elevated',
             recommendation: 'Check vitals and follow your facility pulse-alert response protocol.'
           }}
-          onViewMonitoring={() => {}}
+          onViewMonitoring={() => { void handleViewMonitoring(activeAdminAlert, () => {}); }}
           onAcknowledge={() => {
             void acknowledgeAdminAlert();
           }}
-          onMarkFollowUp={() => {}}
-          onClose={() => {}}
+          onMarkFollowUp={() => { void handleMarkFollowUp(activeAdminAlert, () => {}); }}
+          onClose={() => { void acknowledgeAdminAlert(); }}
         />
       )}
 
@@ -526,7 +641,7 @@ function App() {
         />
       )}
 
-      {activeCaregiverAlert && /sleep/i.test(activeCaregiverAlertType) && (
+      {activeCaregiverAlert && /(sleep|restless|spo2|apnea)/i.test(activeCaregiverAlertType) && (
         <SleepAnomalyModal
           resident={{
             name: activeCaregiverAlert.resident || 'Unknown Resident',
@@ -550,7 +665,7 @@ function App() {
         />
       )}
 
-      {activeCaregiverAlert && /(hr|pulse)/i.test(activeCaregiverAlertType) && (
+      {activeCaregiverAlert && /(hr|pulse|tachycardia|bradycardia|heart)/i.test(activeCaregiverAlertType) && (
         <UnusualPulseModal
           resident={{
             name: activeCaregiverAlert.resident || 'Unknown Resident',
@@ -566,24 +681,36 @@ function App() {
             status: 'elevated',
             recommendation: 'Check vitals and follow your facility pulse-alert response protocol.'
           }}
-          onViewMonitoring={closeCaregiverAlert}
+          onViewMonitoring={() => { void handleViewMonitoring(activeCaregiverAlert, closeCaregiverAlert); }}
           onAcknowledge={() => {
             void acknowledgeCaregiverAlert();
           }}
-          onMarkFollowUp={closeCaregiverAlert}
+          onMarkFollowUp={() => { void handleMarkFollowUp(activeCaregiverAlert, closeCaregiverAlert); }}
           onClose={closeCaregiverAlert}
         />
       )}
 
-      <Header
-        user={currentUser}
-        onLogout={handleLogout}
-        onOpenProfile={() => setShowProfileModal(true)}
-        onProfileUpdated={(updatedUser) => setCurrentUser(updatedUser)}
-        onOpenSecurity={() => setShowSecurityModal(true)}
-        onOpenNotifications={() => setShowNotifications((prev) => !prev)}
-        criticalCount={notifications.filter((n: any) => n.status === 'unacknowledged').length}
-      />
+      <div className="print:hidden">
+        <Header
+          user={currentUser}
+          onLogout={handleLogout}
+          onOpenProfile={() => setShowProfileModal(true)}
+          onProfileUpdated={(updatedUser) => setCurrentUser(updatedUser)}
+          onOpenSecurity={() => setShowSecurityModal(true)}
+          onOpenNotifications={() => {
+            const opening = !showNotifications;
+            setShowNotifications((prev) => !prev);
+            if (opening) {
+              // Mark all currently unacknowledged as viewed → badge resets to 0
+              notifications
+                .filter((n: any) => n.status === 'unacknowledged')
+                .forEach((n: any) => viewedNotifIdsRef.current.add(String(n.id)));
+              setUnseenNotifCount(0);
+            }
+          }}
+          criticalCount={unseenNotifCount}
+        />
+      </div>
       {showNotifications && currentUser.role !== 'relative' && (
         <div className="absolute right-4 top-16 z-40 w-96 max-w-[calc(100vw-2rem)] bg-white border border-slate-200 rounded-xl shadow-xl">
           <div className="px-4 py-3 border-b border-slate-100 font-semibold text-slate-900">Notifications</div>
@@ -626,29 +753,40 @@ function App() {
           user={currentUser}
           onClose={() => setShowProfileModal(false)}
           onSaved={(updatedUser) => setCurrentUser(updatedUser)}
+          onLogout={handleLogout}
         />
       )}
 
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-1 overflow-hidden print:block print:overflow-visible">
         {!isMobile && (
-          <Sidebar
-            currentPage={currentPage}
-            userRole={currentUser.role}
-            onNavigate={handleNavigate}
-          />
+          <div className="print:hidden">
+            <Sidebar
+              currentPage={currentPage}
+              userRole={currentUser.role}
+              onNavigate={handleNavigate}
+            />
+          </div>
         )}
 
-        <main className="flex-1 overflow-auto pb-20 md:pb-0">
+        <main className="flex-1 overflow-auto pb-20 md:pb-0 print:block print:overflow-visible print:pb-0 h-full">
           {renderPage()}
         </main>
       </div>
 
       {isMobile && (
-        <BottomNav
-          currentPage={currentPage}
-          userRole={currentUser.role}
-          onNavigate={handleNavigate}
-        />
+        <div className="print:hidden">
+          <BottomNav
+            currentPage={currentPage}
+            userRole={currentUser.role}
+            onNavigate={handleNavigate}
+          />
+        </div>
+      )}
+
+      {appToast && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-green-600 text-white px-6 py-3 rounded-lg shadow-lg flex items-center gap-2 z-[100] text-sm font-medium">
+          ✓ {appToast}
+        </div>
       )}
     </div>
   );

@@ -6,3 +6,4 @@
 @layer base {
   html, body, #root { min-height: 100vh; height: 100%; margin: 0; }
 }
+@media print { body, html { height: auto !important; overflow: visible !important; background-color: white !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; } .print-hide { display: none !important; } .print-only { display: block !important; } }

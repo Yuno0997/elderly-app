@@ -1,0 +1,1 @@
+const sqlite3 = require('sqlite3'); const db = new sqlite3.Database('./server/data/database.sqlite'); db.all('SELECT id, resident, type, status FROM alerts', (err, rows) => { console.log(JSON.stringify(rows)); db.close(); });

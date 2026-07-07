@@ -3,30 +3,152 @@ import cors from 'cors';
 import express from 'express';
 import http from 'node:http';
 import fs from 'node:fs/promises';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { z } from 'zod';
+import rateLimit from 'express-rate-limit';
+import helmet from 'helmet';
 import { initDb } from './db.js';
 import { BACKUP_DIR, DB_DIR } from './paths.js';
 import { sendUnismsSms, hasUnismsCredentials } from './unisms.js';
+import { getRtdbConfig, rtdbGetJson, rtdbSetJson } from './firebaseRtdb.js';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const FIRST_ADMIN_BOOTSTRAP_KEY = process.env.FIRST_ADMIN_BOOTSTRAP_KEY || '';
 const PASSWORD_REGEX = /^(?=.*[A-Za-z])(?=.*\d).{6,}$/;
 const TEMP_PASSWORD_MIN_LENGTH = 4;
 const IS_PRODUCTION = process.env.APP_ENV === 'production';
+const BAND_FALL_POLL_INTERVAL_MS = Math.max(1000, Number(process.env.BAND_FALL_POLL_INTERVAL_MS || 3000));
+const BAND_VITALS_POLL_INTERVAL_MS = Math.max(1000, Number(process.env.BAND_VITALS_POLL_INTERVAL_MS || 3000));
+const DEFAULT_BAND_DEVICE_ID = String(process.env.BAND_DEVICE_ID || 'SAFEBAND-001').trim();
+const VITALS_STALE_THRESHOLD_MS = Number(process.env.VITALS_STALE_THRESHOLD_MS || 60_000);
 
-if (IS_PRODUCTION && JWT_SECRET === 'dev-secret-change-me') {
-  throw new Error('JWT_SECRET must be set in production.');
+// ── JWT Secret Hardening ──────────────────────────────────────────────────────
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET || JWT_SECRET === 'dev-secret-change-me' || JWT_SECRET.length < 32) {
+  if (IS_PRODUCTION) {
+    console.error('[FATAL] JWT_SECRET is missing, too short, or using the insecure default value.');
+    console.error('[FATAL] Generate one: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
+    process.exit(1);
+  } else {
+    console.warn('[security] JWT_SECRET is weak or missing — using insecure fallback for development only.');
+  }
 }
+const _JWT_SECRET = JWT_SECRET || 'dev-secret-change-me-generate-a-real-one';
+
 if (IS_PRODUCTION && !FIRST_ADMIN_BOOTSTRAP_KEY) {
   throw new Error('FIRST_ADMIN_BOOTSTRAP_KEY must be set in production.');
 }
 
-app.use(cors());
+// Trust the first proxy (ngrok, nginx, etc.) so rate-limit can read real IPs
+// from X-Forwarded-For. Required whenever the app runs behind any proxy.
+app.set('trust proxy', 1);
+
+// ── HTTP Security Headers (Helmet) ────────────────────────────────────────────
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", "data:", "blob:"],
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'", "data:"],
+    },
+  },
+  crossOriginEmbedderPolicy: false,
+}));
+
+// ── CORS ─────────────────────────────────────────────────────────────────────
+// Allow all origins. The API is protected by JWT tokens on every authenticated
+// route — CORS headers add no meaningful security for a token-based API and
+// only cause breakage with ngrok / external domains.
+app.use(cors({ origin: true, credentials: true }));
+
+// ── Rate Limiters ─────────────────────────────────────────────────────────────
+// Progressive login lockout (per IP):
+//   • First  5 consecutive failures  → locked for  1 minute
+//   • Next   5 consecutive failures  → locked for  5 minutes
+// A successful login resets the counter for that IP.
+const loginAttempts = new Map(); // ip → { count, lockedUntil, tier }
+const LOGIN_TIER1_LIMIT = 5;     // attempts before first lock
+const LOGIN_TIER2_LIMIT = 5;     // additional attempts before second lock
+const LOGIN_TIER1_MS   = 60 * 1000;      // 1 minute
+const LOGIN_TIER2_MS   = 5 * 60 * 1000; // 5 minutes
+
+function getClientIp(req) {
+  return (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown').split(',')[0].trim();
+}
+
+function loginLimiter(req, res, next) {
+  const ip = getClientIp(req);
+  const now = Date.now();
+  const entry = loginAttempts.get(ip) || { count: 0, lockedUntil: 0, tier: 0 };
+
+  if (entry.lockedUntil > now) {
+    const retryAfter = Math.ceil((entry.lockedUntil - now) / 1000);
+    const mins = entry.tier >= 2 ? 5 : 1;
+    return res.status(429).json({
+      error: `Too many login attempts. Try again in ${mins} minute${mins > 1 ? 's' : ''}.`,
+      retryAfter,
+    });
+  }
+
+  // Lock window has passed — reset tier tracking if the lock expired
+  if (entry.lockedUntil > 0 && entry.lockedUntil <= now) {
+    entry.lockedUntil = 0;
+    entry.count = 0;
+    // Keep tier so repeated offences escalate
+  }
+
+  req._loginIp = ip;
+  loginAttempts.set(ip, entry);
+  next();
+}
+
+function recordLoginFailure(ip) {
+  const entry = loginAttempts.get(ip) || { count: 0, lockedUntil: 0, tier: 0 };
+  entry.count += 1;
+  const tier1Total = LOGIN_TIER1_LIMIT;
+  const tier2Total = LOGIN_TIER1_LIMIT + LOGIN_TIER2_LIMIT;
+  if (entry.count >= tier2Total && entry.tier < 2) {
+    entry.tier = 2;
+    entry.lockedUntil = Date.now() + LOGIN_TIER2_MS;
+    entry.count = 0;
+  } else if (entry.count >= tier1Total && entry.tier < 1) {
+    entry.tier = 1;
+    entry.lockedUntil = Date.now() + LOGIN_TIER1_MS;
+    entry.count = 0;
+  }
+  loginAttempts.set(ip, entry);
+}
+
+function recordLoginSuccess(ip) {
+  loginAttempts.delete(ip);
+}
+
+// Keep the generic api limiter (generous — mainly flood protection)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: () => !IS_PRODUCTION,
+});
+
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,  // 1 minute
+  max: 500,              // generous — accounts for polling
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: () => !IS_PRODUCTION,
+});
+
 app.use(express.json({ limit: '5mb' }));
+app.use('/api/', apiLimiter);
 const db = await initDb();
 await fs.mkdir(DB_DIR, { recursive: true });
 await fs.mkdir(BACKUP_DIR, { recursive: true });
@@ -38,6 +160,13 @@ try {
   throw new Error(`Backup directory is not writable: ${BACKUP_DIR}`);
 }
 let residentSeq = 1000;
+let lastBandFallDetected = null;
+let bandFallPollInFlight = false;
+let bandVitalsPollInFlight = false;
+let lastBandUnusualPulseDetected = null;
+let bandUnusualPulsePollInFlight = false;
+let lastBandSleepAnomalyDetected = null;
+let bandSleepAnomalyPollInFlight = false;
 
 const residentCreateSchema = z.object({
   name: z.string().trim().min(2),
@@ -156,6 +285,7 @@ const authLoginSchema = z.object({
 });
 const profileUpdateSchema = z.object({
   name: z.string().trim().min(2).optional(),
+  email: z.string().trim().email('Invalid email address').optional(),
   phone: z.string().trim().max(30).nullable().optional(),
   profilePhoto: z
     .string()
@@ -234,18 +364,44 @@ function createToken(user) {
       residentId: user.resident_id ?? undefined,
       tokenVersion: user.token_version ?? 0,
     },
-    JWT_SECRET,
+    _JWT_SECRET,
     { expiresIn: '12h' }
   );
+}
+
+// ── Transaction Helper ────────────────────────────────────────────────────────
+async function withTransaction(fn) {
+  await db.run('BEGIN IMMEDIATE');
+  try {
+    const result = await fn();
+    await db.run('COMMIT');
+    return result;
+  } catch (err) {
+    try { await db.run('ROLLBACK'); } catch {}
+    throw err;
+  }
+}
+
+// ── SSE (Server-Sent Events) — Alert Push ─────────────────────────────────────
+// Clients connect to GET /api/alerts/stream; server pushes alert events.
+const sseClients = new Map(); // userId (string) → Set<res>
+
+function broadcastAlertUpdate(payload) {
+  const json = JSON.stringify(payload);
+  for (const clients of sseClients.values()) {
+    for (const res of clients) {
+      try { res.write(`data: ${json}\n\n`); } catch {}
+    }
+  }
 }
 
 async function logAudit({ category, action, req, details }) {
   try {
     await db.run(
       `INSERT INTO audit_logs (id, timestamp, category, action, user_id, user_name, details)
-       VALUES (?, datetime('now'), ?, ?, ?, ?, ?)`,
+       VALUES (?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?, ?, ?, ?, ?)`,
       [
-        `audit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        randomUUID(),
         category,
         action,
         req?.user?.sub ?? null,
@@ -253,7 +409,8 @@ async function logAudit({ category, action, req, details }) {
         details ?? null,
       ]
     );
-  } catch {
+  } catch (err) {
+    console.error('[audit] logAudit failed:', err?.message || err);
     // Audit logging must not block primary request flow.
   }
 }
@@ -264,7 +421,7 @@ async function logMedicationEvent({ medicationId, resident, medication, action, 
       `INSERT INTO medication_events (id, medication_id, resident, medication, action, actor_user_id, actor_name, event_at, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
       [
-        `medevt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        randomUUID(),
         medicationId,
         resident,
         medication,
@@ -273,8 +430,529 @@ async function logMedicationEvent({ medicationId, resident, medication, action, 
         actorName ?? req?.user?.name ?? null,
       ]
     );
-  } catch {
+  } catch (err) {
+    console.error('[medication-event] logMedicationEvent failed:', err?.message || err);
     // Event logging must not block primary request flow.
+  }
+}
+
+async function ensureBandDeviceHeartbeat({ battery = 100, online = true } = {}) {
+  if (!DEFAULT_BAND_DEVICE_ID) return null;
+
+  const existing = await db.get(
+    `SELECT id, device_id, status, assigned_resident, battery
+     FROM devices
+     WHERE lower(trim(device_id)) = lower(trim(?))
+     LIMIT 1`,
+    [DEFAULT_BAND_DEVICE_ID]
+  );
+
+  const nextStatus = online ? 'online' : 'offline';
+  const nextBattery = Number.isFinite(Number(battery)) ? Math.max(0, Math.min(100, Number(battery))) : 100;
+
+  if (!existing) {
+    const id = randomUUID();
+    await db.run(
+      `INSERT INTO devices (id, device_id, status, assigned_resident, battery, last_seen, created_at, updated_at)
+       VALUES (?, ?, ?, NULL, ?, datetime('now'), datetime('now'), datetime('now'))`,
+      [id, DEFAULT_BAND_DEVICE_ID, nextStatus, nextBattery]
+    );
+    return { id, deviceId: DEFAULT_BAND_DEVICE_ID, status: nextStatus, battery: nextBattery };
+  }
+
+  await db.run(
+    `UPDATE devices
+     SET status = ?, battery = ?, last_seen = datetime('now'), updated_at = datetime('now')
+     WHERE id = ?`,
+    [nextStatus, nextBattery, existing.id]
+  );
+  return {
+    id: existing.id,
+    deviceId: existing.device_id,
+    status: nextStatus,
+    battery: nextBattery,
+    assignedResident: existing.assigned_resident ?? null,
+  };
+}
+
+async function getAssignedBandResidentContext() {
+  const device = await db.get(
+    `SELECT id, device_id, assigned_resident
+     FROM devices
+     WHERE assigned_resident IS NOT NULL AND trim(assigned_resident) != ''
+     ORDER BY updated_at DESC, created_at DESC
+     LIMIT 1`
+  );
+  if (!device?.assigned_resident) return null;
+
+  const resident = await db.get(
+    `SELECT id, name, room
+     FROM residents
+     WHERE archived = 0 AND lower(trim(name)) = lower(trim(?))
+     ORDER BY updated_at DESC, id DESC
+     LIMIT 1`,
+    [String(device.assigned_resident || '').trim()]
+  );
+  if (!resident) return null;
+
+  return {
+    deviceId: String(device.device_id || '').trim(),
+    residentId: resident.id,
+    residentName: String(resident.name || '').trim(),
+    room: String(resident.room || '').trim() || 'N/A',
+  };
+}
+
+/**
+ * Normalize any Philippine phone number format to E.164 (+639XXXXXXXXX).
+ * Accepts: 09XXXXXXXXX, 9XXXXXXXXX, 639XXXXXXXXX, +639XXXXXXXXX
+ * Returns null if the number doesn't look like a valid PH mobile number.
+ */
+function normalizePHPhone(raw) {
+  if (!raw) return null;
+  const digits = String(raw).replace(/[\s\-().+]/g, ''); // strip spaces, dashes, parens, dots, plus
+
+  // Already E.164 style digits: 639XXXXXXXXX (12 digits)
+  if (/^639\d{9}$/.test(digits)) return `+${digits}`;
+
+  // Local format: 09XXXXXXXXX (11 digits)
+  if (/^09\d{9}$/.test(digits)) return `+63${digits.slice(1)}`;
+
+  // Without leading 0: 9XXXXXXXXX (10 digits)
+  if (/^9\d{9}$/.test(digits)) return `+63${digits}`;
+
+  // Already has + but stripped: just prepend
+  if (/^63\d{10}$/.test(digits)) return `+${digits}`;
+
+  return null; // unrecognized format — skip
+}
+
+/**
+ * Collect phone numbers for a resident and send an SMS alert to all relevant contacts.
+ * Recipients: assigned caregiver, family member users, resident emergency contacts.
+ * Fire-and-forget — never throws; failures are logged only.
+ */
+async function sendAlertSms({ residentName, room, message }) {
+  if (!hasUnismsCredentials()) return;
+  try {
+    const phones = new Set();
+
+    // 1. Assigned caregiver's phone
+    const caregiver = await db.get(
+      `SELECT u.phone FROM users u
+       INNER JOIN residents r ON r.caregiver_user_id = u.id
+       WHERE lower(trim(r.name)) = lower(trim(?)) AND r.archived = 0
+       LIMIT 1`,
+      [residentName]
+    );
+    const normalized1 = normalizePHPhone(caregiver?.phone);
+    if (normalized1) phones.add(normalized1);
+
+    // 2. Family member (relative) accounts linked to this resident
+    const relatives = await db.all(
+      `SELECT phone, resident_id, resident_ids FROM users
+       WHERE role = 'relative' AND active = 1 AND phone IS NOT NULL AND trim(phone) != ''`
+    );
+    const residentRow = await db.get(
+      `SELECT id FROM residents WHERE lower(trim(name)) = lower(trim(?)) AND archived = 0 LIMIT 1`,
+      [residentName]
+    );
+    if (residentRow) {
+      const rid = residentRow.id;
+      const pubId = `RES-${1000 + rid}`;
+      for (const u of relatives) {
+        let ids = [];
+        try { ids = JSON.parse(u.resident_ids || '[]'); } catch { ids = []; }
+        if (ids.includes(rid) || ids.includes(String(rid)) || ids.includes(pubId)
+            || u.resident_id === pubId || u.resident_id === String(rid)) {
+          const normalized2 = normalizePHPhone(u.phone);
+          if (normalized2) phones.add(normalized2);
+        }
+      }
+    }
+
+    // 3. Emergency contacts stored in residents.contacts JSON
+    const residentContacts = await db.get(
+      `SELECT contacts FROM residents WHERE lower(trim(name)) = lower(trim(?)) AND archived = 0 LIMIT 1`,
+      [residentName]
+    );
+    if (residentContacts?.contacts) {
+      try {
+        const contacts = JSON.parse(residentContacts.contacts);
+        if (Array.isArray(contacts)) {
+          for (const c of contacts) {
+            const ph = c?.phone || c?.number || c?.mobile || '';
+            const normalized3 = normalizePHPhone(ph);
+            if (normalized3) phones.add(normalized3);
+          }
+        }
+      } catch { /* ignore malformed contacts */ }
+    }
+
+    if (phones.size === 0) {
+      console.log('[sms] No phone numbers found for resident:', residentName);
+      return;
+    }
+
+    const smsBody = message.slice(0, 160);
+    for (const phone of phones) {
+      const result = await sendUnismsSms({ recipient: phone, content: smsBody });
+      if (result.ok) {
+        console.log(`[sms] Sent to ${phone}: OK`);
+      } else {
+        console.warn(`[sms] Failed to send to ${phone}:`, result.error);
+      }
+    }
+  } catch (err) {
+    console.error('[sms] sendAlertSms error:', err?.message || err);
+  }
+}
+
+async function createBandFallAlert({ timestamp }) {
+  const ctx = await getAssignedBandResidentContext();
+  if (!ctx) return { created: false, reason: 'no_assigned_resident' };
+
+  const existing = await db.get(
+    `SELECT id, status
+     FROM alerts
+     WHERE lower(trim(type)) = lower('Fall Detected')
+       AND lower(trim(resident)) = lower(trim(?))
+       AND status = 'unacknowledged'
+     ORDER BY timestamp DESC, created_at DESC
+     LIMIT 1`,
+    [ctx.residentName]
+  );
+  if (existing) return { created: false, reason: 'existing_open_alert', alertId: existing.id };
+
+  const id = randomUUID();
+  const finalTimestamp = timestamp || new Date().toISOString();
+  await db.run(
+    `INSERT INTO alerts (id, type, severity, resident, room, timestamp, status, created_at, updated_at)
+     VALUES (?, 'Fall Detected', 'critical', ?, ?, ?, 'unacknowledged', datetime('now'), datetime('now'))`,
+    [id, ctx.residentName, ctx.room, finalTimestamp]
+  );
+  await logAudit({
+    category: 'incident',
+    action: 'Band fall detected',
+    req: null,
+    details: `Band-triggered fall alert for ${ctx.residentName} room=${ctx.room} device=${ctx.deviceId || 'unknown'}`,
+  });
+
+  // Notify caregiver, family, and emergency contacts via SMS
+  void sendAlertSms({
+    residentName: ctx.residentName,
+    room: ctx.room,
+    message: `SAFEBAND ALERT: Fall detected for ${ctx.residentName} in Room ${ctx.room}. Please respond immediately. -SafeAlert Band`,
+  });
+
+  return { created: true, alertId: id, residentName: ctx.residentName };
+}
+
+async function pollBandFallState() {
+  if (bandFallPollInFlight) return;
+  bandFallPollInFlight = true;
+  try {
+    const cfg = getRtdbConfig();
+    if (!cfg.databaseUrl) return;
+    const data = await rtdbGetJson(cfg, `${cfg.prefix}/fall`);
+    const detected = Boolean(data?.detected);
+    const timestamp = typeof data?.timestamp === 'string' ? data.timestamp : new Date().toISOString();
+
+    if (detected && lastBandFallDetected !== true) {
+      // Fall just detected — create a new alert in the DB
+      await createBandFallAlert({ timestamp });
+    } else if (!detected && lastBandFallDetected === true) {
+      // Fall cleared by hardware button press — auto-resolve any open DB alerts
+      await autoResolveBandFallAlerts();
+    }
+    lastBandFallDetected = detected;
+  } catch (err) {
+    console.error('[band-fall] Poll failed:', err?.message || err);
+  } finally {
+    bandFallPollInFlight = false;
+  }
+}
+
+async function pollBandVitalsState() {
+  if (bandVitalsPollInFlight) return;
+  bandVitalsPollInFlight = true;
+  try {
+    const cfg = getRtdbConfig();
+    if (!cfg.databaseUrl) return;
+    const data = await rtdbGetJson(cfg, `${cfg.prefix}/vitals`);
+
+    // Read actual battery level from hardware (Arduino should send data.battery)
+    const batteryRaw = data?.battery ?? data?.batteryLevel ?? data?.bat;
+    const battery = Number.isFinite(Number(batteryRaw))
+      ? Math.min(100, Math.max(0, Math.round(Number(batteryRaw))))
+      : null; // null = hardware hasn’t sent battery yet
+
+    const hasRecentSignal =
+      Boolean(data) &&
+      (
+        Number.isFinite(Number(data?.heartRate)) ||
+        Number.isFinite(Number(data?.spo2)) ||
+        Number.isFinite(Number(data?.accel)) ||
+        Number.isFinite(Number(data?.gyro)) ||
+        typeof data?.timestamp === 'string'
+      );
+    await ensureBandDeviceHeartbeat({ battery: battery ?? 100, online: hasRecentSignal });
+
+    // Low battery alert (< 20%) — create once, not repeatedly
+    if (battery !== null && battery < 20) {
+      const ctx = await getAssignedBandResidentContext();
+      if (ctx) {
+        const existing = await db.get(
+          `SELECT id FROM alerts WHERE type = 'Low Band Battery' AND status = 'unacknowledged' LIMIT 1`
+        );
+        if (!existing) {
+          const batteryAlertId = randomUUID();
+          await db.run(
+            `INSERT INTO alerts (id, type, severity, resident, room, timestamp, status, created_at, updated_at)
+             VALUES (?, 'Low Band Battery', 'warning', ?, ?, ?, 'unacknowledged', datetime('now'), datetime('now'))`,
+            [batteryAlertId, ctx.residentName, ctx.room, new Date().toISOString()]
+          );
+          console.warn(`[band-battery] Low battery (${battery}%) alert created for ${ctx.residentName}`);
+          broadcastAlertUpdate({
+            type: 'alert_created',
+            alert: { id: batteryAlertId, type: 'Low Band Battery', severity: 'warning', resident: ctx.residentName, room: ctx.room, status: 'unacknowledged' },
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[band-vitals] Poll failed:', err?.message || err);
+  } finally {
+    bandVitalsPollInFlight = false;
+  }
+}
+
+async function clearBandFallState({ timestamp } = {}) {
+  const cfg = getRtdbConfig();
+  if (!cfg.databaseUrl) return { cleared: false, reason: 'missing_database_url' };
+  const nextTimestamp = typeof timestamp === 'string' && timestamp.trim()
+    ? timestamp.trim()
+    : new Date().toISOString();
+  await rtdbSetJson(cfg, `${cfg.prefix}/fall`, {
+    detected: false,
+    timestamp: nextTimestamp,
+  });
+  lastBandFallDetected = false;
+  return { cleared: true };
+}
+
+async function clearBandUnusualPulseState() {
+  const cfg = getRtdbConfig();
+  if (!cfg.databaseUrl) return;
+  await rtdbSetJson(cfg, `${cfg.prefix}/unusualPulse`, {
+    detected: false,
+    timestamp: new Date().toISOString(),
+  });
+  lastBandUnusualPulseDetected = false;
+  console.log('[band-pulse] Firebase /unusualPulse cleared after acknowledge');
+}
+
+async function clearBandSleepAnomalyState() {
+  const cfg = getRtdbConfig();
+  if (!cfg.databaseUrl) return;
+  await rtdbSetJson(cfg, `${cfg.prefix}/sleepAnomaly`, {
+    detected: false,
+    timestamp: new Date().toISOString(),
+  });
+  lastBandSleepAnomalyDetected = false;
+  console.log('[band-sleep] Firebase /sleepAnomaly cleared after acknowledge');
+}
+
+// Auto-resolve all open band fall alerts in the DB.
+// Called when the hardware button press clears /safeband/fall/detected → false.
+async function autoResolveBandFallAlerts() {
+  try {
+    const ctx = await getAssignedBandResidentContext();
+    if (!ctx) return;
+    const openAlerts = await db.all(
+      `SELECT id FROM alerts
+       WHERE lower(trim(type)) = lower('Fall Detected')
+         AND lower(trim(resident)) = lower(trim(?))
+         AND status = 'unacknowledged'`,
+      [ctx.residentName]
+    );
+    for (const alert of openAlerts) {
+      await db.run(
+        `UPDATE alerts SET status = 'resolved', updated_at = datetime('now') WHERE id = ?`,
+        [alert.id]
+      );
+      console.log('[band-fall] Auto-resolved fall alert via hardware button:', alert.id);
+    }
+    if (openAlerts.length > 0) {
+      await logAudit({
+        category: 'incident',
+        action: 'Band fall auto-resolved',
+        req: null,
+        details: `Hardware button pressed — auto-resolved ${openAlerts.length} fall alert(s) for ${ctx.residentName}`,
+      });
+    }
+  } catch (err) {
+    console.error('[band-fall] Auto-resolve failed:', err?.message || err);
+  }
+}
+
+// ── Unusual Pulse Polling ─────────────────────────────────────────────────────
+async function pollBandUnusualPulseState() {
+  if (bandUnusualPulsePollInFlight) return;
+  bandUnusualPulsePollInFlight = true;
+  try {
+    const cfg = getRtdbConfig();
+    if (!cfg.databaseUrl) return;
+    const data = await rtdbGetJson(cfg, `${cfg.prefix}/unusualPulse`);
+    const detected = Boolean(data?.detected);
+
+    if (detected && lastBandUnusualPulseDetected !== true) {
+      // Transition false→true: create a DB alert
+      const ctx = await getAssignedBandResidentContext();
+      if (ctx) {
+        const existing = await db.get(
+          `SELECT id FROM alerts
+           WHERE (lower(trim(type)) LIKE '%pulse%'
+              OR lower(trim(type)) LIKE '%heart rate%'
+              OR lower(trim(type)) LIKE '%tachycardia%'
+              OR lower(trim(type)) LIKE '%bradycardia%')
+             AND lower(trim(resident)) = lower(trim(?))
+             AND status = 'unacknowledged'
+           ORDER BY timestamp DESC LIMIT 1`,
+          [ctx.residentName]
+        );
+        if (!existing) {
+          const severity = String(data?.severity || 'warning') === 'critical' ? 'critical' : 'warning';
+          const label = String(data?.type || 'Unusual Pulse Rate');
+          const ts = String(data?.timestamp || new Date().toISOString());
+          const id = randomUUID();
+          await db.run(
+            `INSERT INTO alerts (id, type, severity, resident, room, timestamp, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'unacknowledged', datetime('now'), datetime('now'))`,
+            [id, label, severity, ctx.residentName, ctx.room, ts]
+          );
+          await logAudit({
+            category: 'incident',
+            action: 'Band unusual pulse detected',
+            req: null,
+            details: `Unusual pulse alert (${label} / ${severity}) for ${ctx.residentName} room=${ctx.room}`,
+          });
+          console.log('[band-pulse] Alert created:', label, severity, ctx.residentName);
+
+          // SMS only for critical pulse alerts
+          if (severity === 'critical') {
+            void sendAlertSms({
+              residentName: ctx.residentName,
+              room: ctx.room,
+              message: `SAFEBAND ALERT: Critical pulse anomaly (${label}) detected for ${ctx.residentName}, Room ${ctx.room}. HR: ${data?.heartRate || 'N/A'} bpm. -SafeAlert Band`,
+            });
+          }
+        }
+      }
+    } else if (!detected && lastBandUnusualPulseDetected === true) {
+      // Transition true→false: auto-resolve open pulse alerts
+      const ctx = await getAssignedBandResidentContext();
+      if (ctx) {
+        const openAlerts = await db.all(
+          `SELECT id FROM alerts
+           WHERE (lower(trim(type)) LIKE '%pulse%' OR lower(trim(type)) LIKE '%heart rate%'
+             OR lower(trim(type)) LIKE '%tachycardia%' OR lower(trim(type)) LIKE '%bradycardia%')
+             AND lower(trim(resident)) = lower(trim(?))
+             AND status = 'unacknowledged'`,
+          [ctx.residentName]
+        );
+        for (const alert of openAlerts) {
+          await db.run(
+            `UPDATE alerts SET status = 'resolved', updated_at = datetime('now') WHERE id = ?`,
+            [alert.id]
+          );
+          console.log('[band-pulse] Auto-resolved pulse alert:', alert.id);
+        }
+      }
+    }
+    lastBandUnusualPulseDetected = detected;
+  } catch (err) {
+    console.error('[band-pulse] Poll failed:', err?.message || err);
+  } finally {
+    bandUnusualPulsePollInFlight = false;
+  }
+}
+
+// ── Sleep Anomaly Polling ─────────────────────────────────────────────────────
+async function pollBandSleepAnomalyState() {
+  if (bandSleepAnomalyPollInFlight) return;
+  bandSleepAnomalyPollInFlight = true;
+  try {
+    const cfg = getRtdbConfig();
+    if (!cfg.databaseUrl) return;
+    const data = await rtdbGetJson(cfg, `${cfg.prefix}/sleepAnomaly`);
+    const detected = Boolean(data?.detected);
+
+    if (detected && lastBandSleepAnomalyDetected !== true) {
+      // Transition false→true: create a DB alert
+      const ctx = await getAssignedBandResidentContext();
+      if (ctx) {
+        const label = String(data?.type || 'Sleep Anomaly');
+        const ts = String(data?.timestamp || new Date().toISOString());
+        const id = `band-sleep-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+        const existing = await db.get(
+          `SELECT id FROM alerts
+           WHERE (lower(trim(type)) LIKE '%sleep%'
+              OR lower(trim(type)) LIKE '%restless%'
+              OR lower(trim(type)) LIKE '%spo2%'
+              OR lower(trim(type)) LIKE '%apnea%')
+             AND lower(trim(resident)) = lower(trim(?))
+             AND status = 'unacknowledged'
+           ORDER BY timestamp DESC LIMIT 1`,
+          [ctx.residentName]
+        );
+        if (!existing) {
+          await db.run(
+            `INSERT INTO alerts (id, type, severity, resident, room, timestamp, status, created_at, updated_at)
+             VALUES (?, ?, 'warning', ?, ?, ?, 'unacknowledged', datetime('now'), datetime('now'))`,
+            [id, label, ctx.residentName, ctx.room, ts]
+          );
+          await logAudit({
+            category: 'incident',
+            action: 'Band sleep anomaly detected',
+            req: null,
+            details: `Sleep anomaly (${label}) for ${ctx.residentName} room=${ctx.room}`,
+          });
+          console.log('[band-sleep] Alert created:', label, ctx.residentName);
+
+          // Notify via SMS
+          void sendAlertSms({
+            residentName: ctx.residentName,
+            room: ctx.room,
+            message: `SAFEBAND ALERT: Sleep anomaly detected (${label}) for ${ctx.residentName}, Room ${ctx.room}. Please check on resident. -SafeAlert Band`,
+          });
+        }
+      }
+    } else if (!detected && lastBandSleepAnomalyDetected === true) {
+      // Transition true→false: auto-resolve open sleep anomaly alerts
+      const ctx = await getAssignedBandResidentContext();
+      if (ctx) {
+        const openAlerts = await db.all(
+          `SELECT id FROM alerts
+           WHERE lower(trim(type)) LIKE '%sleep%'
+             AND lower(trim(resident)) = lower(trim(?))
+             AND status = 'unacknowledged'`,
+          [ctx.residentName]
+        );
+        for (const alert of openAlerts) {
+          await db.run(
+            `UPDATE alerts SET status = 'resolved', updated_at = datetime('now') WHERE id = ?`,
+            [alert.id]
+          );
+          console.log('[band-sleep] Auto-resolved sleep anomaly alert:', alert.id);
+        }
+      }
+    }
+    lastBandSleepAnomalyDetected = detected;
+  } catch (err) {
+    console.error('[band-sleep] Poll failed:', err?.message || err);
+  } finally {
+    bandSleepAnomalyPollInFlight = false;
   }
 }
 
@@ -377,7 +1055,8 @@ async function mapCareTaskRowsToPayload(rows) {
   });
 }
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', loginLimiter, async (req, res) => {
+  const ip = req._loginIp || getClientIp(req);
   const parsed = authLoginSchema.safeParse(req.body);
   if (!parsed.success) return validationError(res, parsed);
   const { email, password } = parsed.data;
@@ -386,10 +1065,31 @@ app.post('/api/auth/login', async (req, res) => {
       'SELECT id, name, email, password_hash, role, resident_id, resident_ids, active, must_change_password, token_version FROM users WHERE email = ?',
       [email.toLowerCase()]
     );
-    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!user) {
+      recordLoginFailure(ip);
+      // Return remaining retryAfter if we just got locked
+      const entry = loginAttempts.get(ip);
+      if (entry?.lockedUntil > Date.now()) {
+        const retryAfter = Math.ceil((entry.lockedUntil - Date.now()) / 1000);
+        const mins = entry.tier >= 2 ? 5 : 1;
+        return res.status(401).json({ error: 'Invalid credentials', lockedOut: true, retryAfter, lockMessage: `Too many login attempts. Try again in ${mins} minute${mins > 1 ? 's' : ''}.` });
+      }
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
     if (!user.active) return res.status(403).json({ error: 'Account disabled' });
     const ok = await bcrypt.compare(password, user.password_hash);
-    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!ok) {
+      recordLoginFailure(ip);
+      const entry = loginAttempts.get(ip);
+      if (entry?.lockedUntil > Date.now()) {
+        const retryAfter = Math.ceil((entry.lockedUntil - Date.now()) / 1000);
+        const mins = entry.tier >= 2 ? 5 : 1;
+        return res.status(401).json({ error: 'Invalid credentials', lockedOut: true, retryAfter, lockMessage: `Too many login attempts. Try again in ${mins} minute${mins > 1 ? 's' : ''}.` });
+      }
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    // Successful login — clear lockout state for this IP
+    recordLoginSuccess(ip);
     const token = createToken(user);
     let residentIds = [];
     try {
@@ -416,7 +1116,7 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-app.post('/api/auth/bootstrap-admin', async (req, res) => {
+app.post('/api/auth/bootstrap-admin', authLimiter, async (req, res) => {
   const parsed = bootstrapAdminSchema.safeParse(req.body);
   if (!parsed.success) return validationError(res, parsed);
   if (!FIRST_ADMIN_BOOTSTRAP_KEY || parsed.data.key !== FIRST_ADMIN_BOOTSTRAP_KEY) {
@@ -427,7 +1127,7 @@ app.post('/api/auth/bootstrap-admin', async (req, res) => {
     if ((adminCount?.count ?? 0) > 0) {
       return res.status(409).json({ error: 'Bootstrap already completed' });
     }
-    const id = `u${Date.now()}`;
+    const id = randomUUID();
     const hash = await bcrypt.hash(parsed.data.password, 10);
     await db.run(
       `INSERT INTO users (id, name, email, password_hash, role, resident_id, active, must_change_password, created_at, updated_at)
@@ -485,6 +1185,14 @@ app.patch('/api/auth/profile', requireAuth, async (req, res) => {
     fields.push('name = ?');
     values.push(parsed.data.name);
   }
+  if (parsed.data.email !== undefined) {
+    const newEmail = parsed.data.email.toLowerCase();
+    // Check if the new email is already taken by another user
+    const existing = await db.get('SELECT id FROM users WHERE email = ? AND id != ?', [newEmail, req.user.sub]);
+    if (existing) return res.status(409).json({ error: 'Email is already in use by another account.' });
+    fields.push('email = ?');
+    values.push(newEmail);
+  }
   if (parsed.data.phone !== undefined) {
     fields.push('phone = ?');
     values.push(parsed.data.phone);
@@ -501,6 +1209,7 @@ app.patch('/api/auth/profile', requireAuth, async (req, res) => {
       'SELECT id, name, email, phone, profile_photo, role, resident_id, must_change_password FROM users WHERE id = ?',
       [req.user.sub]
     );
+    const emailChanged = parsed.data.email !== undefined && parsed.data.email.toLowerCase() !== req.user.email?.toLowerCase();
     return res.json({
       id: user.id,
       name: user.name,
@@ -510,6 +1219,7 @@ app.patch('/api/auth/profile', requireAuth, async (req, res) => {
       role: user.role,
       residentId: user.resident_id ?? undefined,
       mustChangePassword: Boolean(user.must_change_password),
+      emailChanged,
     });
   } catch {
     return res.status(500).json({ error: 'Failed to update profile' });
@@ -537,7 +1247,7 @@ app.post('/api/auth/logout-all-sessions', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/auth/change-password', requireAuth, async (req, res) => {
+app.post('/api/auth/change-password', authLimiter, requireAuth, async (req, res) => {
   const parsed = changePasswordSchema.safeParse(req.body);
   if (!parsed.success) return validationError(res, parsed);
   try {
@@ -587,7 +1297,15 @@ app.get('/api/audit-logs', requireAuth, requireRole('admin'), async (_req, res) 
     const rows = await db.all(
       'SELECT id, timestamp, category, action, user_id, user_name, details FROM audit_logs ORDER BY timestamp DESC LIMIT 500'
     );
-    return res.json(rows);
+    // Ensure timestamp strings are unambiguous UTC so the browser parses them correctly.
+    // SQLite datetime('now') returns "2026-05-26 05:26:14" (no timezone marker).
+    // Appending 'Z' makes it ISO-8601 UTC so new Date('...Z') gives the right time.
+    return res.json(rows.map((r) => ({
+      ...r,
+      timestamp: r.timestamp
+        ? (String(r.timestamp).endsWith('Z') ? r.timestamp : String(r.timestamp).replace(' ', 'T') + 'Z')
+        : r.timestamp,
+    })));
   } catch {
     return res.status(500).json({ error: 'Failed to fetch audit logs' });
   }
@@ -596,32 +1314,94 @@ app.get('/api/audit-logs', requireAuth, requireRole('admin'), async (_req, res) 
 app.delete('/api/admin/logs/clear-all', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const before = {
-      auditLogs: (await db.get('SELECT COUNT(*) AS count FROM audit_logs'))?.count ?? 0,
       incidentLogs: (await db.get('SELECT COUNT(*) AS count FROM alerts'))?.count ?? 0,
       medicationEvents: (await db.get('SELECT COUNT(*) AS count FROM medication_events'))?.count ?? 0,
       completedTasks: (await db.get('SELECT COUNT(*) AS count FROM care_tasks WHERE completed = 1'))?.count ?? 0,
       givenMedications: (await db.get('SELECT COUNT(*) AS count FROM medications WHERE given = 1'))?.count ?? 0,
     };
 
+    // NOTE: Audit logs are intentionally NOT deleted — they are retained by policy.
+    // Deleting audit evidence after an incident would be a regulatory violation.
     await db.run('DELETE FROM alerts');
     await db.run('DELETE FROM medication_events');
     await db.run('DELETE FROM care_tasks WHERE completed = 1');
     await db.run('DELETE FROM medications WHERE given = 1');
-    await db.run('DELETE FROM audit_logs');
 
     const cleared = {
-      auditLogs: before.auditLogs,
       incidentLogs: before.incidentLogs,
       medicationEvents: before.medicationEvents,
       completedTasks: before.completedTasks,
       givenMedications: before.givenMedications,
+      auditLogs: 0, // audit logs are never deleted
     };
     const totalCleared = Object.values(cleared).reduce((sum, n) => sum + Number(n || 0), 0);
 
-    // Do not write another audit log entry after clearing, because audit logs are intentionally wiped.
+    await logAudit({
+      category: 'admin',
+      action: 'Operational logs cleared',
+      req,
+      details: `Cleared: ${before.incidentLogs} alerts, ${before.medicationEvents} medication events, ${before.completedTasks} completed tasks, ${before.givenMedications} given medications. Audit log retained.`,
+    });
     return res.json({ ok: true, cleared, totalCleared });
-  } catch {
-    return res.status(500).json({ error: 'Failed to clear all logs' });
+  } catch (err) {
+    console.error('[clear-all]', err);
+    return res.status(500).json({ error: 'Failed to clear logs' });
+  }
+});
+
+// ── Shift Handover Report ────────────────────────────────────────────────────
+app.get('/api/reports/shift-handover', requireAuth, requireRole('admin', 'caregiver'), async (req, res) => {
+  const hoursBack = Math.min(48, Math.max(1, Number(req.query.hours ?? 12)));
+  const since = new Date(Date.now() - hoursBack * 3600_000).toISOString();
+  try {
+    const [recentAlerts, medicationsGiven, medicationsPending, tasksCompleted] = await Promise.all([
+      db.all(
+        `SELECT type, severity, resident, room, timestamp, status
+         FROM alerts WHERE created_at >= ? ORDER BY timestamp DESC LIMIT 100`,
+        [since]
+      ),
+      db.all(
+        `SELECT me.resident, me.medication, me.event_at, me.actor_name
+         FROM medication_events me
+         WHERE me.event_at >= ? AND me.action = 'given'
+         ORDER BY me.event_at DESC LIMIT 200`,
+        [since]
+      ),
+      db.all(
+        `SELECT m.resident, m.medication, m.time
+         FROM medications m
+         WHERE m.given = 0 AND m.time != 'As prescribed'
+         ORDER BY m.time ASC LIMIT 100`
+      ),
+      db.all(
+        `SELECT t.task_type, t.completed_at, u.name AS caregiver_name, t.priority
+         FROM care_tasks t
+         LEFT JOIN users u ON u.id = t.caregiver_user_id
+         WHERE t.completed = 1 AND t.completed_at >= ?
+         ORDER BY t.completed_at DESC LIMIT 100`,
+        [since]
+      ),
+    ]);
+    return res.json({
+      generatedAt: new Date().toISOString(),
+      periodHours: hoursBack,
+      since,
+      summary: {
+        totalAlerts: recentAlerts.length,
+        criticalAlerts: recentAlerts.filter((a) => a.severity === 'critical').length,
+        unresolvedAlerts: recentAlerts.filter((a) => a.status === 'unacknowledged').length,
+        medicationsGiven: medicationsGiven.length,
+        medicationsPending: medicationsPending.length,
+        tasksCompleted: tasksCompleted.length,
+      },
+      alerts: recentAlerts,
+      medicationsGiven,
+      medicationsPending,
+      tasksCompleted,
+    });
+  } catch (err) {
+    console.error('[shift-handover]', err);
+    return res.status(500).json({ error: 'Failed to generate shift handover report' });
   }
 });
 
@@ -694,7 +1474,7 @@ app.post('/api/admin/alert-simulation', requireAuth, requireRole('admin'), async
   }[scenario];
 
   const makeAlert = async ({ resident, room, simulationTarget, simulationTargetUserId }) => {
-    const id = `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const id = randomUUID();
     await db.run(
       `INSERT INTO alerts (id, type, severity, resident, room, timestamp, status, is_simulation, simulation_target, simulation_target_user_id, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, 'unacknowledged', 1, ?, ?, datetime('now'), datetime('now'))`,
@@ -752,11 +1532,7 @@ app.post('/api/admin/alert-simulation', requireAuth, requireRole('admin'), async
           [targetAdminId, scenarioMeta.type]
         );
         if (dup) continue;
-        await db.run(
-          `DELETE FROM alerts
-           WHERE is_simulation = 1 AND simulation_target = 'admin' AND simulation_target_user_id = ?`,
-          [targetAdminId]
-        );
+        // intentionally not deleting previous simulation alerts so they can stack
         await makeAlert({ resident: r.name, room: r.room, simulationTarget: 'admin', simulationTargetUserId: targetAdminId });
         created += 1;
       }
@@ -764,7 +1540,7 @@ app.post('/api/admin/alert-simulation', requireAuth, requireRole('admin'), async
         category: 'incident',
         action: 'Alert simulation',
         req,
-        details: `scenario=${scenario} target=admin recipients=${targets.length} resident=${r.name} room=${r.room}`,
+        details: `Scenario: ${scenario} — Target: Admins (${targets.length} recipient(s)) — Resident: ${r.name} (Room ${r.room})`,
       });
       return res.status(201).json({ created, skipped: 0 });
     }
@@ -792,11 +1568,7 @@ app.post('/api/admin/alert-simulation', requireAuth, requireRole('admin'), async
           [targetCaregiverId, scenarioMeta.type]
         );
         if (dup) continue;
-        await db.run(
-          `DELETE FROM alerts
-           WHERE is_simulation = 1 AND simulation_target = 'caregiver' AND simulation_target_user_id = ?`,
-          [targetCaregiverId]
-        );
+        // intentionally not deleting previous simulation alerts so they can stack
         await makeAlert({ resident: r.name, room: r.room, simulationTarget: 'caregiver', simulationTargetUserId: targetCaregiverId });
         created += 1;
       }
@@ -804,7 +1576,7 @@ app.post('/api/admin/alert-simulation', requireAuth, requireRole('admin'), async
         category: 'incident',
         action: 'Alert simulation',
         req,
-        details: `scenario=${scenario} target=caregiver selected=${targets.length} created=${created} skipped=${skipped}`,
+        details: `Scenario: ${scenario} — Target: Caregivers (${targets.length} selected, ${created} created, ${skipped} skipped)`,
       });
       return res.status(201).json({ created, skipped });
     }
@@ -819,8 +1591,7 @@ app.post('/api/admin/alert-simulation', requireAuth, requireRole('admin'), async
       });
     }
 
-    // Clear previous simulation entries for a clean "all" send.
-    await db.run(`DELETE FROM alerts WHERE is_simulation = 1 AND simulation_target IN ('all', 'caregiver', 'admin')`);
+    // Clear previous simulation entries removed to allow stacking simulated alerts
 
     for (const c of caregiverRows) {
       const r = await pickResidentForCaregiver(String(c.id));
@@ -849,7 +1620,7 @@ app.post('/api/admin/alert-simulation', requireAuth, requireRole('admin'), async
       category: 'incident',
       action: 'Alert simulation',
       req,
-      details: `scenario=${scenario} target=all recipients=admins+caregivers created=${created} skipped=${skipped}`,
+      details: `Scenario: ${scenario} — Target: All staff (admins + caregivers) — ${created} alert(s) created, ${skipped} skipped`,
     });
     return res.status(201).json({ created, skipped });
   } catch (err) {
@@ -868,7 +1639,7 @@ app.post('/api/users', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const exists = await db.get('SELECT id FROM users WHERE email = ?', [email.toLowerCase()]);
     if (exists) return res.status(409).json({ error: 'Email already exists' });
-    const id = `u${Date.now()}`;
+    const id = randomUUID();
     const hash = await bcrypt.hash(password, 10);
     let finalResidentIds = Array.isArray(residentIds) ? residentIds.filter(Boolean) : [];
     if (residentId && !finalResidentIds.includes(residentId)) finalResidentIds = [residentId, ...finalResidentIds];
@@ -887,7 +1658,7 @@ app.post('/api/users', requireAuth, requireRole('admin'), async (req, res) => {
       category: 'user',
       action: 'User created',
       req,
-      details: `Created user ${user.name} (${user.email}) role=${user.role}`,
+      details: `New ${user.role} account created for ${user.name} (${user.email})`,
     });
     let outResidentIds = [];
     try {
@@ -974,7 +1745,7 @@ app.patch('/api/users/:id', requireAuth, requireRole('admin'), async (req, res) 
       category: 'user',
       action: 'User updated',
       req,
-      details: `Updated user ${user.name} (${user.email})`,
+      details: `Profile updated for ${user.name} (${user.email})`,
     });
     let outResidentIds = [];
     try {
@@ -1036,7 +1807,7 @@ app.delete('/api/users/:id', requireAuth, requireRole('admin'), async (req, res)
       category: 'user',
       action: 'User deleted',
       req,
-      details: `Deleted user ${user.name} (${user.email}) role=${user.role}`,
+      details: `Account deleted for ${user.name} (${user.email}), role: ${user.role}`,
     });
     return res.status(204).send();
   } catch {
@@ -1059,7 +1830,7 @@ app.patch('/api/users/:id/reset-password', requireAuth, requireRole('admin'), as
       category: 'user',
       action: 'Password reset',
       req,
-      details: `Reset password for user ${id}`,
+      details: `Temporary password set for user ID ${id} — must change on next login`,
     });
     return res.json({ success: true });
   } catch {
@@ -1073,6 +1844,146 @@ app.get('/api/health', (_req, res) => {
     service: 'elderly-app-backend',
     timestamp: new Date().toISOString(),
   });
+});
+
+// ─── SafeAlert Band (Firebase RTDB bridge) ─────────────────────────────────────
+app.get('/api/band/status', requireAuth, async (_req, res) => {
+  const cfg = getRtdbConfig();
+  return res.json({
+    configured: Boolean(cfg.databaseUrl),
+    prefix: cfg.prefix,
+    hasSecret: Boolean(cfg.secret),
+  });
+});
+
+// ── Raw Firebase debug endpoint (admin only) ──────────────────────────────────
+// Visit /api/band/raw to see exactly what your Arduino is sending.
+// Use this to verify field names (heartRate vs bpm vs pulse, etc.)
+app.get('/api/band/raw', requireAuth, requireRole('admin'), async (_req, res) => {
+  const cfg = getRtdbConfig();
+  if (!cfg.databaseUrl) return res.status(503).json({ error: 'Firebase not configured' });
+  try {
+    const data = await rtdbGetJson(cfg, cfg.prefix);
+    const device = await db.get(
+      `SELECT device_id, assigned_resident, battery, status, last_seen FROM devices WHERE lower(trim(device_id)) = lower(trim(?)) LIMIT 1`,
+      [DEFAULT_BAND_DEVICE_ID]
+    );
+    return res.json({
+      firebase_raw: data,
+      firebase_prefix: cfg.prefix,
+      db_device: device ?? null,
+      field_check: {
+        heartRate:  data?.vitals?.heartRate  ?? data?.heartRate  ?? '(missing)',
+        bpm:        data?.vitals?.bpm        ?? data?.bpm        ?? '(missing)',
+        pulse:      data?.vitals?.pulse      ?? data?.pulse      ?? '(missing)',
+        heart_rate: data?.vitals?.heart_rate ?? data?.heart_rate ?? '(missing)',
+        hr:         data?.vitals?.hr         ?? data?.hr         ?? '(missing)',
+        spo2:       data?.vitals?.spo2       ?? data?.spo2       ?? '(missing)',
+        SpO2:       data?.vitals?.SpO2       ?? data?.SpO2       ?? '(missing)',
+        timestamp:  data?.vitals?.timestamp  ?? data?.timestamp  ?? '(missing)',
+      },
+    });
+  } catch (err) {
+    return res.status(502).json({ error: String(err?.message || err) });
+  }
+});
+
+app.get('/api/band/vitals', requireAuth, async (_req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  const cfg = getRtdbConfig();
+  if (!cfg.databaseUrl) {
+    return res.status(503).json({
+      error: 'Band feed not configured',
+      detail: 'Set FIREBASE_DATABASE_URL (and optionally FIREBASE_DB_SECRET) on the backend.',
+    });
+  }
+  try {
+    const data = await rtdbGetJson(cfg, `${cfg.prefix}/vitals`);
+
+    // ── Field-name resolution ─────────────────────────────────────────────────
+    // Arduino sketches use many different field names. Try them all.
+    const resolveNum = (...keys) => {
+      for (const k of keys) {
+        const v = data?.[k];
+        if (v !== undefined && v !== null && Number.isFinite(Number(v))) return Number(v);
+      }
+      return null;
+    };
+
+    const heartRate = resolveNum('heartRate', 'heart_rate', 'bpm', 'pulse', 'hr', 'BPM', 'HeartRate');
+    const spo2     = resolveNum('spo2', 'SpO2', 'SPO2', 'sp02', 'oxygen', 'bloodOxygen');
+    const accel    = resolveNum('accel', 'acceleration', 'accelMag', 'accelTotal', 'ax');
+    const gyro     = resolveNum('gyro', 'gyroscope', 'gyroMag', 'gz');
+
+    // ── Stale Data Detection ──────────────────────────────────────────────────
+    // The Arduino's clock is 15 hours out of sync with the server, meaning
+    // any timestamp calculation marks the data as heavily stale and hides the HR.
+    // For now, we will trust the data in Firebase directly.
+    let isStale = false;
+    let dataAgeSeconds = null;
+
+    const rawTs = data?.timestamp ?? data?.ts ?? data?.time ?? null;
+    // We still extract the timestamp to pass to the frontend, but we DO NOT
+    // enforce isStale = true anymore.
+    if (rawTs !== null && rawTs !== undefined) {
+      let tsMs = null;
+      if (typeof rawTs === 'string') {
+        const parsed = new Date(rawTs).getTime();
+        if (!isNaN(parsed)) tsMs = parsed;
+      } else if (typeof rawTs === 'number' && rawTs > 0) {
+        tsMs = rawTs < 1e10 ? rawTs * 1000 : rawTs;
+      }
+      if (tsMs !== null) {
+        const ageMs = Date.now() - tsMs;
+        dataAgeSeconds = Math.round(ageMs / 1000);
+      }
+    }
+
+    return res.json({
+      fingerDetected: isStale ? false : Boolean(data?.fingerDetected ?? data?.finger ?? data?.fingerOn),
+      heartRate: isStale ? null : heartRate,
+      spo2:      isStale ? null : spo2,
+      accel:     isStale ? null : accel,
+      gyro:      isStale ? null : gyro,
+      isSleeping: Boolean(data?.isSleeping ?? data?.sleeping ?? false),
+      timestamp: rawTs ?? null,
+      isStale,
+      dataAgeSeconds,
+      raw: data ?? null,
+    });
+  } catch (err) {
+    return res.status(502).json({
+      error: 'Failed to fetch band vitals',
+      detail: IS_PRODUCTION ? undefined : String(err?.message || err),
+    });
+  }
+});
+
+app.get('/api/band/fall', requireAuth, async (_req, res) => {
+  const cfg = getRtdbConfig();
+  if (!cfg.databaseUrl) {
+    return res.status(503).json({
+      error: 'Band feed not configured',
+      detail: 'Set FIREBASE_DATABASE_URL (and optionally FIREBASE_DB_SECRET) on the backend.',
+    });
+  }
+  try {
+    const data = await rtdbGetJson(cfg, `${cfg.prefix}/fall`);
+    return res.json({
+      detected: Boolean(data?.detected),
+      timestamp: typeof data?.timestamp === 'string' ? data.timestamp : null,
+      heartRate: Number.isFinite(Number(data?.heartRate)) ? Number(data?.heartRate) : null,
+      spo2: Number.isFinite(Number(data?.spo2)) ? Number(data?.spo2) : null,
+      raw: data ?? null,
+    });
+  } catch (err) {
+    return res.status(502).json({
+      error: 'Failed to fetch band fall status',
+      detail: IS_PRODUCTION ? undefined : String(err?.message || err),
+    });
+  }
 });
 
 app.get('/api/settings/facility', requireAuth, async (_req, res) => {
@@ -1115,7 +2026,10 @@ app.patch('/api/settings/facility', requireAuth, requireRole('admin'), async (re
       category: 'settings',
       action: 'Facility settings updated',
       req,
-      details: `facilityName=${facilityName ?? '(unchanged)'} facilityId=${facilityId ?? '(unchanged)'}`,
+      details: [
+        facilityName !== undefined ? `Facility Name: "${facilityName}"` : null,
+        facilityId !== undefined ? `Facility ID: "${facilityId}"` : null,
+      ].filter(Boolean).join(' — ') || 'No changes',
     });
     const rows = await db.all(
       `SELECT key, value FROM app_settings WHERE key IN ('facility_name', 'facility_id')`
@@ -1127,6 +2041,149 @@ app.patch('/api/settings/facility', requireAuth, requireRole('admin'), async (re
     });
   } catch {
     return res.status(500).json({ error: 'Failed to update facility settings' });
+  }
+});
+
+// ─── Sleep Window Settings ─────────────────────────────────────────────────────
+app.get('/api/settings/sleep-window', requireAuth, async (_req, res) => {
+  try {
+    const rows = await db.all(
+      `SELECT key, value FROM app_settings WHERE key IN ('sleep_window_start', 'sleep_window_end')`
+    );
+    const map = new Map(rows.map((r) => [String(r.key), String(r.value ?? '')]));
+    return res.json({
+      startHour: Number(map.get('sleep_window_start') ?? 21),
+      endHour: Number(map.get('sleep_window_end') ?? 6),
+    });
+  } catch {
+    return res.status(500).json({ error: 'Failed to fetch sleep window settings' });
+  }
+});
+
+app.put('/api/settings/sleep-window', requireAuth, requireRole('admin'), async (req, res) => {
+  const { startHour, endHour } = req.body ?? {};
+  const start = Number(startHour);
+  const end   = Number(endHour);
+  if (!Number.isInteger(start) || start < 0 || start > 23 ||
+      !Number.isInteger(end)   || end   < 0 || end   > 23) {
+    return res.status(400).json({ error: 'startHour and endHour must be integers 0–23' });
+  }
+  if (start === end) {
+    return res.status(400).json({ error: 'Start and end hour cannot be the same' });
+  }
+  try {
+    await db.run(
+      `INSERT INTO app_settings (key, value, updated_at)
+       VALUES ('sleep_window_start', ?, datetime('now'))
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
+      [String(start)]
+    );
+    await db.run(
+      `INSERT INTO app_settings (key, value, updated_at)
+       VALUES ('sleep_window_end', ?, datetime('now'))
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
+      [String(end)]
+    );
+    // Push to Firebase RTDB so the hardware picks it up automatically
+    try {
+      const cfg = getRtdbConfig();
+      if (cfg.databaseUrl) {
+        await rtdbSetJson(cfg, `${cfg.prefix}/config/sleepWindow`, {
+          startHour: start,
+          endHour: end,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    } catch (fbErr) {
+      console.warn('[sleep-window] Firebase write failed:', fbErr?.message || fbErr);
+      // Non-fatal — DB is source of truth, Firebase is for hardware sync
+    }
+    await logAudit({
+      category: 'settings',
+      action: 'Sleep window updated',
+      req,
+      details: `Sleep window set to ${start}:00 – ${end}:00 (24-hour)`,
+    });
+    return res.json({ startHour: start, endHour: end });
+  } catch {
+    return res.status(500).json({ error: 'Failed to update sleep window settings' });
+  }
+});
+
+// ─── HR Threshold Settings ─────────────────────────────────────────────────────
+app.get('/api/settings/hr-thresholds', requireAuth, async (_req, res) => {
+  try {
+    const keys = ['hr_warn_low', 'hr_warn_high', 'hr_crit_low', 'hr_crit_high'];
+    const rows = await db.all(
+      `SELECT key, value FROM app_settings WHERE key IN ('hr_warn_low','hr_warn_high','hr_crit_low','hr_crit_high')`
+    );
+    const map = new Map(rows.map((r) => [String(r.key), String(r.value ?? '')]));
+    return res.json({
+      warnLow:  Number(map.get('hr_warn_low')  ?? 60),
+      warnHigh: Number(map.get('hr_warn_high') ?? 100),
+      critLow:  Number(map.get('hr_crit_low')  ?? 45),
+      critHigh: Number(map.get('hr_crit_high') ?? 130),
+    });
+  } catch {
+    return res.status(500).json({ error: 'Failed to fetch HR threshold settings' });
+  }
+});
+
+app.put('/api/settings/hr-thresholds', requireAuth, requireRole('admin'), async (req, res) => {
+  const { warnLow, warnHigh, critLow, critHigh } = req.body ?? {};
+  const wl = Number(warnLow);
+  const wh = Number(warnHigh);
+  const cl = Number(critLow);
+  const ch = Number(critHigh);
+
+  if (!Number.isInteger(wl) || wl < 20 || wl > 200 ||
+      !Number.isInteger(wh) || wh < 20 || wh > 250 ||
+      !Number.isInteger(cl) || cl < 20 || cl > 200 ||
+      !Number.isInteger(ch) || ch < 20 || ch > 250) {
+    return res.status(400).json({ error: 'All HR thresholds must be integers between 20 and 250 bpm' });
+  }
+  if (cl >= wl) return res.status(400).json({ error: 'Critical low must be less than warning low' });
+  if (wl >= wh) return res.status(400).json({ error: 'Warning low must be less than warning high' });
+  if (wh >= ch) return res.status(400).json({ error: 'Warning high must be less than critical high' });
+
+  try {
+    const upsert = async (key, val) => db.run(
+      `INSERT INTO app_settings (key, value, updated_at)
+       VALUES (?, ?, datetime('now'))
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
+      [key, String(val)]
+    );
+    await upsert('hr_warn_low',  wl);
+    await upsert('hr_warn_high', wh);
+    await upsert('hr_crit_low',  cl);
+    await upsert('hr_crit_high', ch);
+
+    // Push to Firebase RTDB so the hardware picks it up automatically
+    try {
+      const cfg = getRtdbConfig();
+      if (cfg.databaseUrl) {
+        await rtdbSetJson(cfg, `${cfg.prefix}/config/hrThresholds`, {
+          warnLow:  wl,
+          warnHigh: wh,
+          critLow:  cl,
+          critHigh: ch,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    } catch (fbErr) {
+      console.warn('[hr-thresholds] Firebase write failed:', fbErr?.message || fbErr);
+      // Non-fatal — DB is source of truth, Firebase is for hardware sync
+    }
+
+    await logAudit({
+      category: 'settings',
+      action: 'HR thresholds updated',
+      req,
+      details: `Warning: ${wl}–${wh} bpm — Critical: below ${cl} or above ${ch} bpm`,
+    });
+    return res.json({ warnLow: wl, warnHigh: wh, critLow: cl, critHigh: ch });
+  } catch {
+    return res.status(500).json({ error: 'Failed to update HR threshold settings' });
   }
 });
 
@@ -1146,6 +2203,36 @@ app.get('/api/family/residents', requireAuth, requireRole('relative'), async (re
     return res.json(rows);
   } catch {
     return res.status(500).json({ error: 'Failed to fetch family residents' });
+  }
+});
+
+// Returns detailed info for one resident + their assigned caregiver (for family Health Records page)
+app.get('/api/family/resident-info', requireAuth, requireRole('relative'), async (req, res) => {
+  try {
+    const residentPublicId = String(req.query.residentId || '').trim();
+    const m = /^RES-(\d+)$/i.exec(residentPublicId);
+    const dbId = m ? Number(m[1]) - 1000 : NaN;
+    if (!Number.isFinite(dbId)) return res.status(400).json({ error: 'Invalid residentId' });
+
+    const linked = await getFamilyLinkedResidents(req);
+    if (!linked.includes(dbId)) return res.status(403).json({ error: 'Not authorized for this resident' });
+
+    const row = await db.get(
+      `SELECT r.id, r.name, r.room, r.status, r.profile_photo,
+              r.date_of_birth, r.gender, r.medical_conditions AS condition,
+              u.name          AS caregiver_name,
+              u.profile_photo AS caregiver_photo,
+              u.email         AS caregiver_email,
+              u.phone         AS caregiver_phone
+       FROM residents r
+       LEFT JOIN users u ON u.id = r.caregiver_user_id AND u.role = 'caregiver'
+       WHERE r.id = ? AND r.archived = 0`,
+      [dbId]
+    );
+    if (!row) return res.status(404).json({ error: 'Resident not found' });
+    return res.json(row);
+  } catch {
+    return res.status(500).json({ error: 'Failed to fetch resident info' });
   }
 });
 
@@ -1333,7 +2420,7 @@ app.post('/api/residents', requireAuth, requireRole('admin'), async (req, res) =
       category: 'resident',
       action: 'Resident created',
       req,
-      details: `Created resident ${row.name} room=${row.room} status=${row.status} caregiver=${row.caregiver_name ?? 'unassigned'}`,
+      details: `New resident profile: ${row.name}, Room ${row.room}, Status: ${row.status}, Caregiver: ${row.caregiver_name ?? 'Unassigned'}`,
     });
     return res.status(201).json(row);
   } catch {
@@ -1480,7 +2567,7 @@ app.patch('/api/residents/:id', requireAuth, requireRole('admin', 'caregiver'), 
       category: 'resident',
       action: 'Resident updated',
       req,
-      details: `Updated resident ${row.name} room=${row.room} status=${row.status} archived=${row.archived} caregiver=${row.caregiver_name ?? 'unassigned'}`,
+      details: `Updated profile for ${row.name} — Room: ${row.room}, Status: ${row.status}, Caregiver: ${row.caregiver_name ?? 'Unassigned'}`,
     });
     return res.json(row);
   } catch {
@@ -1501,7 +2588,7 @@ app.delete('/api/residents/:id', requireAuth, requireRole('admin'), async (req, 
       category: 'resident',
       action: 'Resident archived',
       req,
-      details: `Archived resident id=${id}`,
+      details: `Resident ID ${id} moved to archive`,
     });
     return res.status(204).send();
   } catch {
@@ -1574,7 +2661,7 @@ app.delete('/api/residents/:id/permanent', requireAuth, requireRole('admin'), as
       category: 'resident',
       action: 'Resident permanently deleted',
       req,
-      details: `Permanently deleted resident id=${id} name=${resident.name}`,
+      details: `Permanently deleted resident: ${resident.name} (ID: ${id})`,
     });
     return res.status(204).send();
   } catch {
@@ -1620,7 +2707,7 @@ app.post('/api/care-tasks', requireAuth, requireRole('admin'), async (req, res) 
     if (residentRows.length !== uniqueIds.length) {
       return res.status(400).json({ error: 'One or more residents are invalid or archived' });
     }
-    const id = `task-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const id = randomUUID();
     await db.run(
       `INSERT INTO care_tasks (id, caregiver_user_id, resident_ids, task_type, schedule_time, priority, notes, completed, completed_at, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, datetime('now'), datetime('now'))`,
@@ -1630,7 +2717,7 @@ app.post('/api/care-tasks', requireAuth, requireRole('admin'), async (req, res) 
       category: 'task',
       action: 'Care task created',
       req,
-      details: `Created task ${taskType} for caregiver ${caregiver.name} with ${uniqueIds.length} resident(s)`,
+      details: `Task "${taskType}" assigned to ${caregiver.name} for ${uniqueIds.length} resident(s)`,
     });
     const created = await db.get(
       `SELECT t.id, t.caregiver_user_id, u.name AS caregiver_name, t.resident_ids, t.task_type, t.schedule_time, t.priority, t.notes, t.completed, t.completed_at, t.created_at, t.updated_at
@@ -1706,7 +2793,7 @@ app.delete('/api/care-tasks/:id', requireAuth, requireRole('admin'), async (req,
       category: 'task',
       action: 'Care task removed',
       req,
-      details: `Removed task ${task.task_type} (${id})`,
+      details: `Removed care task: ${task.task_type}`,
     });
     return res.status(204).send();
   } catch {
@@ -1754,7 +2841,7 @@ async function handleCareTaskCompletion(req, res) {
       category: 'task',
       action: completed ? 'Care task completed' : 'Care task reopened',
       req,
-      details: `${completed ? 'Completed' : 'Reopened'} task ${task.task_type} (${id})`,
+      details: `Task "${task.task_type}" marked as ${completed ? 'completed' : 'reopened'}`,
     });
     return res.json(payload);
   } catch (err) {
@@ -1768,6 +2855,34 @@ async function handleCareTaskCompletion(req, res) {
 
 app.patch('/api/care-tasks/:id', requireAuth, requireRole('admin', 'caregiver'), handleCareTaskCompletion);
 app.put('/api/care-tasks/:id', requireAuth, requireRole('admin', 'caregiver'), handleCareTaskCompletion);
+
+// ── SSE — Alert Stream Endpoint ────────────────────────────────────────────────────
+app.get('/api/alerts/stream', requireAuth, (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders();
+  // Tell client to auto-reconnect after 3s if stream drops
+  res.write('retry: 3000\n\n');
+
+  const userId = String(req.user.sub);
+  if (!sseClients.has(userId)) sseClients.set(userId, new Set());
+  sseClients.get(userId).add(res);
+
+  // Heartbeat so proxies don't close the connection
+  const hb = setInterval(() => {
+    try { res.write(': ping\n\n'); } catch {}
+  }, 25000);
+
+  req.on('close', () => {
+    clearInterval(hb);
+    sseClients.get(userId)?.delete(res);
+    if (sseClients.get(userId)?.size === 0) sseClients.delete(userId);
+  });
+});
 
 app.get('/api/alerts', requireAuth, requireRole('admin', 'caregiver'), async (_req, res) => {
   try {
@@ -1825,6 +2940,7 @@ app.get('/api/alerts', requireAuth, requireRole('admin', 'caregiver'), async (_r
   }
 });
 
+// ── Medication duplicate prevention + allergy cross-check ───────────────────
 app.post('/api/admin/alert-simulation/clear', requireAuth, requireRole('admin'), async (req, res) => {
   const parsed = adminAlertSimulationSchema.safeParse(req.body);
   if (!parsed.success) return validationError(res, parsed);
@@ -1918,7 +3034,7 @@ app.post('/api/medications', requireAuth, requireRole('admin', 'caregiver'), asy
   const parsed = medicationCreateSchema.safeParse(req.body);
   if (!parsed.success) return validationError(res, parsed);
   const { residentId, resident, medication, time } = parsed.data;
-  const id = `med-${Date.now()}`;
+  const id = randomUUID();
   try {
     let resolvedResidentName = '';
     if (Number.isFinite(residentId)) {
@@ -1945,6 +3061,26 @@ app.post('/api/medications', requireAuth, requireRole('admin', 'caregiver'), asy
         return res.status(403).json({ error: 'You can only add medications for your assigned residents' });
       }
       resolvedResidentName = String(byName.name || '').trim();
+    }
+
+    // Allergy cross-check before creating
+    const residentRecord = await db.get(
+      'SELECT allergies FROM residents WHERE lower(trim(name)) = lower(trim(?)) AND archived = 0 LIMIT 1',
+      [resolvedResidentName]
+    );
+    if (residentRecord?.allergies) {
+      const allergyText = String(residentRecord.allergies).toLowerCase();
+      const medName = medication.toLowerCase();
+      const medWords = medName.split(/[\s,/\-]+/).filter((w) => w.length > 3);
+      const hasConflict = allergyText.includes(medName) ||
+        medWords.some((w) => allergyText.includes(w));
+      if (hasConflict && !req.body?.overrideAllergyCheck) {
+        return res.status(409).json({
+          error: 'Allergy conflict detected',
+          detail: `"${medication}" may conflict with recorded allergy: "${residentRecord.allergies}". Send overrideAllergyCheck: true to proceed.`,
+          allergyConflict: true,
+        });
+      }
     }
 
     await db.run(
@@ -2045,7 +3181,7 @@ app.post('/api/devices', requireAuth, requireRole('admin'), async (req, res) => 
   const parsed = deviceCreateSchema.safeParse(req.body);
   if (!parsed.success) return validationError(res, parsed);
   const { deviceId, status, battery } = parsed.data;
-  const id = `dev-${Date.now()}`;
+  const id = randomUUID();
   try {
     await db.run(
       `INSERT INTO devices (id, device_id, status, assigned_resident, battery, last_seen, created_at, updated_at)
@@ -2060,7 +3196,7 @@ app.post('/api/devices', requireAuth, requireRole('admin'), async (req, res) => 
       category: 'device',
       action: 'Device created',
       req,
-      details: `Created device ${row.device_id} status=${row.status} battery=${row.battery}`,
+      details: `Device "${row.device_id}" registered — Status: ${row.status}, Battery: ${row.battery}%`,
     });
     return res.status(201).json({
       id: row.id,
@@ -2108,7 +3244,7 @@ app.patch('/api/devices/:id', requireAuth, requireRole('admin'), async (req, res
       category: 'device',
       action: 'Device updated',
       req,
-      details: `Updated device ${row.device_id} status=${row.status} assignedResident=${row.assigned_resident ?? 'none'}`,
+      details: `Device "${row.device_id}" updated — Status: ${row.status}, Assigned to: ${row.assigned_resident ?? 'None'}`,
     });
     return res.json({
       id: row.id,
@@ -2125,28 +3261,63 @@ app.patch('/api/devices/:id', requireAuth, requireRole('admin'), async (req, res
   }
 });
 
-app.patch('/api/alerts/:id', requireAuth, requireRole('admin', 'caregiver'), (req, res) => {
+app.patch('/api/alerts/:id', requireAuth, requireRole('admin', 'caregiver'), async (req, res) => {
   const { id } = req.params;
   const parsed = alertStatusSchema.safeParse(req.body);
   if (!parsed.success) return validationError(res, parsed);
-  const { status } = parsed.data;
-  db.run('UPDATE alerts SET status = ? WHERE id = ?', [status, id])
-    .then((result) => {
-      if (!result.changes) {
-        return res.status(404).json({ error: 'Alert not found' });
+  const requestedStatus = parsed.data.status;
+  try {
+    const existing = await db.get('SELECT id, type, severity, resident, room, timestamp, status FROM alerts WHERE id = ?', [id]);
+    if (!existing) return res.status(404).json({ error: 'Alert not found' });
+
+    const isFallAlert  = /fall/i.test(String(existing.type || ''));
+    const isPulseAlert = /(pulse|tachycardia|bradycardia|heart rate)/i.test(String(existing.type || ''));
+    const isSleepAlert = /(sleep|restless|spo2|apnea|awake at midnight|prolonged sleep)/i.test(String(existing.type || ''));
+
+    // Fall alerts: treat acknowledge as resolve so future falls create fresh alerts
+    const finalStatus = (isFallAlert && requestedStatus === 'acknowledged') ? 'resolved' : requestedStatus;
+
+    const result = await db.run('UPDATE alerts SET status = ?, updated_at = datetime(\'now\') WHERE id = ?', [finalStatus, id]);
+    if (!result.changes) return res.status(404).json({ error: 'Alert not found' });
+
+    const row = await db.get('SELECT id, type, severity, resident, room, timestamp, status FROM alerts WHERE id = ?', [id]);
+    if (!row) {
+      return res.status(404).json({ error: 'Alert not found' });
+    }
+
+    // Clear Firebase detected flag so the next hardware trigger fires a fresh notification
+    if (isFallAlert && (finalStatus === 'acknowledged' || finalStatus === 'resolved')) {
+      try {
+        await clearBandFallState({ timestamp: row.timestamp });
+      } catch (err) {
+        console.error('[band-fall] Failed to clear RTDB state after alert acknowledgement:', err?.message || err);
       }
-      return db.get('SELECT id, type, severity, resident, room, timestamp, status FROM alerts WHERE id = ?', [id])
-        .then(async (row) => {
-          await logAudit({
-            category: 'incident',
-            action: 'Alert status updated',
-            req,
-            details: `Alert ${id} set to ${row.status} (${row.type} for ${row.resident})`,
-          });
-          return res.json(row);
-        });
-    })
-    .catch(() => res.status(500).json({ error: 'Failed to update alert' }));
+    }
+    if (isPulseAlert && (finalStatus === 'acknowledged' || finalStatus === 'resolved')) {
+      try {
+        await clearBandUnusualPulseState();
+      } catch (err) {
+        console.error('[band-pulse] Failed to clear RTDB state after alert acknowledgement:', err?.message || err);
+      }
+    }
+    if (isSleepAlert && (finalStatus === 'acknowledged' || finalStatus === 'resolved')) {
+      try {
+        await clearBandSleepAnomalyState();
+      } catch (err) {
+        console.error('[band-sleep] Failed to clear RTDB state after alert acknowledgement:', err?.message || err);
+      }
+    }
+
+    await logAudit({
+      category: 'incident',
+      action: 'Alert status updated',
+      req,
+      details: `${row.type} alert for ${row.resident} — Status changed to: ${row.status}`,
+    });
+    return res.json(row);
+  } catch {
+    return res.status(500).json({ error: 'Failed to update alert' });
+  }
 });
 
 app.patch('/api/medications/:id', requireAuth, requireRole('admin', 'caregiver'), (req, res) => {
@@ -2180,7 +3351,7 @@ app.patch('/api/medications/:id', requireAuth, requireRole('admin', 'caregiver')
             category: 'medication',
             action: 'Medication updated',
             req,
-            details: `Medication ${row.medication} for ${row.resident} marked ${row.given ? 'given' : 'pending'}`,
+            details: `${row.medication} for ${row.resident} marked as ${row.given ? 'Given' : 'Pending'}`,
           });
           return res.json({ ...row, given: Boolean(row.given) });
         });
@@ -2189,15 +3360,113 @@ app.patch('/api/medications/:id', requireAuth, requireRole('admin', 'caregiver')
 });
 
 const server = http.createServer(app);
+
+// ── Missed Medication Checker (every 15 min) ────────────────────────────────────
+async function checkMissedMedications() {
+  try {
+    const overdue = await db.all(`
+      SELECT m.id, m.resident, m.medication, m.time
+      FROM medications m
+      WHERE m.given = 0
+        AND m.time != 'As prescribed'
+        AND m.time GLOB '[0-2][0-9]:[0-5][0-9]'
+    `);
+
+    // Use Philippine time (UTC+8)
+    const nowPH = new Date(Date.now() + 8 * 3_600_000);
+    const nowMinutes = nowPH.getUTCHours() * 60 + nowPH.getUTCMinutes();
+
+    for (const med of overdue) {
+      const [hStr, mStr] = String(med.time).split(':');
+      const schedMinutes = Number(hStr) * 60 + Number(mStr);
+      if (isNaN(schedMinutes)) continue;
+      const lateMinutes = nowMinutes - schedMinutes;
+      // Flag as missed if 30min–240min past scheduled time
+      if (lateMinutes < 30 || lateMinutes > 240) continue;
+
+      const existingAlert = await db.get(
+        `SELECT id FROM alerts
+         WHERE type = 'Missed Medication' AND resident = ?
+           AND status = 'unacknowledged'
+           AND details LIKE ?`,
+        [med.resident, `%${med.medication}%`]
+      );
+      if (existingAlert) continue;
+
+      const residentRow = await db.get(
+        `SELECT room FROM residents WHERE lower(trim(name)) = lower(trim(?)) AND archived = 0 LIMIT 1`,
+        [med.resident]
+      );
+      const alertId = randomUUID();
+      await db.run(
+        `INSERT INTO alerts (id, type, severity, resident, room, timestamp, status, created_at, updated_at)
+         VALUES (?, 'Missed Medication', 'warning', ?, ?, ?, 'unacknowledged', datetime('now'), datetime('now'))`,
+        [alertId, med.resident, residentRow?.room ?? 'N/A', new Date().toISOString()]
+      );
+      console.warn(`[med-check] Missed medication: ${med.medication} for ${med.resident} (${lateMinutes}min late)`);
+      broadcastAlertUpdate({
+        type: 'alert_created',
+        alert: { id: alertId, type: 'Missed Medication', severity: 'warning', resident: med.resident, room: residentRow?.room ?? 'N/A', status: 'unacknowledged', timestamp: new Date().toISOString() },
+      });
+    }
+  } catch (err) {
+    console.error('[med-check] Failed:', err?.message || err);
+  }
+}
+
+let fallPollTimer, vitalsPollTimer, pulsePollTimer, sleepPollTimer, medCheckTimer;
+
+// --- Serve React Frontend in Production ---
+const distPath = path.join(process.cwd(), 'build');
+app.use(express.static(distPath));
+app.get('*', (req, res, next) => {
+  if (req.path.startsWith('/api/')) return next();
+  res.sendFile(path.join(distPath, 'index.html'));
+});
+
 server.listen(PORT, () => {
   console.log(`Backend running at http://localhost:${PORT}`);
+  void pollBandVitalsState();
+  void pollBandFallState();
+  void pollBandUnusualPulseState();
+  void pollBandSleepAnomalyState();
+  vitalsPollTimer = setInterval(() => void pollBandVitalsState(), BAND_VITALS_POLL_INTERVAL_MS);
+  fallPollTimer   = setInterval(() => void pollBandFallState(),   BAND_FALL_POLL_INTERVAL_MS);
+  pulsePollTimer  = setInterval(() => void pollBandUnusualPulseState(), BAND_FALL_POLL_INTERVAL_MS);
+  sleepPollTimer  = setInterval(() => void pollBandSleepAnomalyState(), BAND_FALL_POLL_INTERVAL_MS);
+  medCheckTimer   = setInterval(() => void checkMissedMedications(), 15 * 60_000);
+  // Run first check after 1 min to avoid false positives on server start
+  setTimeout(() => void checkMissedMedications(), 60_000);
 });
+
 server.on('error', (err) => {
   console.error('[server] Failed to start HTTP server:', err.message || err);
   if (err.code === 'EADDRINUSE') {
     console.error(
-      `[server] Port ${PORT} is already in use. Stop the other Node process or run with a different PORT (e.g. set PORT=4001 and match Vite proxy).`
+      `[server] Port ${PORT} is already in use. Stop the other Node process or run with a different PORT.`
     );
   }
   process.exit(1);
 });
+
+// ── Graceful Shutdown ─────────────────────────────────────────────────────────
+async function shutdown(signal) {
+  console.log(`[server] ${signal} received — shutting down gracefully...`);
+  clearInterval(fallPollTimer);
+  clearInterval(vitalsPollTimer);
+  clearInterval(pulsePollTimer);
+  clearInterval(sleepPollTimer);
+  clearInterval(medCheckTimer);
+  // Close all SSE connections
+  for (const clients of sseClients.values()) {
+    for (const res of clients) { try { res.end(); } catch {} }
+  }
+  server.close(async () => {
+    try { await db.close(); } catch {}
+    console.log('[server] Database closed. Goodbye.');
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(1), 5000).unref();
+}
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT',  () => void shutdown('SIGINT'));

@@ -61,6 +61,16 @@ export async function initDb() {
     driver: sqlite3.Database,
   });
 
+  // ── Performance & Reliability Pragmas ──────────────────────────────────────────
+  // WAL mode allows concurrent reads during writes and is crash-safer
+  await db.exec(`PRAGMA journal_mode=WAL`);
+  // NORMAL sync is safe with WAL and much faster than FULL
+  await db.exec(`PRAGMA synchronous=NORMAL`);
+  // Enforce foreign key constraints
+  await db.exec(`PRAGMA foreign_keys=ON`);
+  // Wait up to 5 seconds if the DB is locked (prevents SQLITE_BUSY errors)
+  await db.exec(`PRAGMA busy_timeout=5000`);
+
   await db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
@@ -256,5 +266,25 @@ export async function initDb() {
   );
 
   await seedIfEmpty(db);
+
+  // ── Performance Indexes ────────────────────────────────────────────────────────────
+  // Created after all schema migrations so they always cover current columns.
+  // CREATE INDEX IF NOT EXISTS is idempotent — safe to run on every boot.
+  await db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_alerts_status       ON alerts(status);
+    CREATE INDEX IF NOT EXISTS idx_alerts_resident     ON alerts(resident);
+    CREATE INDEX IF NOT EXISTS idx_alerts_timestamp    ON alerts(timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_alerts_created_at   ON alerts(created_at);
+    CREATE INDEX IF NOT EXISTS idx_meds_resident       ON medications(resident);
+    CREATE INDEX IF NOT EXISTS idx_meds_given          ON medications(given);
+    CREATE INDEX IF NOT EXISTS idx_tasks_caregiver     ON care_tasks(caregiver_user_id);
+    CREATE INDEX IF NOT EXISTS idx_tasks_completed     ON care_tasks(completed);
+    CREATE INDEX IF NOT EXISTS idx_med_events_med_id   ON medication_events(medication_id);
+    CREATE INDEX IF NOT EXISTS idx_med_events_event_at ON medication_events(event_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_residents_archived  ON residents(archived);
+    CREATE INDEX IF NOT EXISTS idx_users_email         ON users(email);
+    CREATE INDEX IF NOT EXISTS idx_users_role          ON users(role, active);
+  `);
+
   return db;
 }

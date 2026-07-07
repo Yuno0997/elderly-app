@@ -6,6 +6,8 @@ $xamppHtdocs = "C:\xampp\htdocs"
 $appDir = Join-Path $xamppHtdocs "elderly-app"
 $templatesDir = Join-Path $projectRoot "xampp"
 
+& (Join-Path $PSScriptRoot "sync-xampp-apache-config.ps1")
+
 Write-Host "Building frontend..."
 Push-Location $projectRoot
 try {
@@ -42,4 +44,4 @@ Write-Host "1) Start Apache in XAMPP (port 80)."
 Write-Host "2) Start backend in this project: npm run start"
 Write-Host "3) Start tunnel: npm run tunnel:ngrok"
 Write-Host ""
-Write-Host "Apache proxy config for /api is in: $templatesDir\apache-elderly-app.conf"
+Write-Host "Apache proxy snippet source: $templatesDir\apache-elderly-app.conf (synced to C:\xampp\apache\conf\extra\)"

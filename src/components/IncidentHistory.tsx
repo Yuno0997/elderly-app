@@ -60,8 +60,8 @@ export function IncidentHistory({ user }: IncidentHistoryProps) {
   }, [incidents, statusFilter]);
 
   return (
-    <div className="p-4 md:p-6 max-w-4xl">
-      <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-5">
+    <div className="p-4 md:p-6 min-h-full flex flex-col">
+      <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-5 flex-1 flex flex-col">
         <div className="flex items-center justify-between mb-4">
           <div>
             <h1 className="text-xl font-semibold text-slate-900">Incident History</h1>

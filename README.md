@@ -219,6 +219,37 @@ In production, set `ALLOW_DEMO_SEED=false` to disable all demo user seeding.
 
 - `GET /api/audit-logs`
 
+## SafeAlert Band integration (Arduino → Web App)
+
+Your `SAFEBAND_TESTFINAL.ino` already writes live data to **Firebase Realtime Database** under:
+
+- `/safeband/vitals`
+- `/safeband/fall`
+
+This web app includes a backend “bridge” that reads those RTDB paths and exposes them to the frontend:
+
+- `GET /api/band/vitals` (auth required)
+- `GET /api/band/fall` (auth required)
+- `GET /api/band/status` (auth required)
+
+For single-device demos, the backend also polls `/safeband/fall` and creates a real `Fall Detected` alert in the app when:
+
+- the band reports `detected=true`
+- an admin-assigned device exists in the `Devices` page
+- that device is assigned to an existing resident
+
+The generated alert stays manual-resolve in the UI, which is usually the cleanest demo flow.
+
+### Configure the backend
+
+Create `.env` in the project root (or set environment variables) and add:
+
+- `FIREBASE_DATABASE_URL=https://<your-project>-default-rtdb.firebaseio.com`
+- `FIREBASE_DB_SECRET=<optional legacy secret if your RTDB requires it>`
+- `FIREBASE_RTDB_PREFIX=/safeband` (optional)
+
+Restart the backend after setting env vars.
+
 ## Audit Logging Coverage
 
 The backend now writes immutable audit log records for:

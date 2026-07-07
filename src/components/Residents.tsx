@@ -229,41 +229,57 @@ export function Residents({ userRole }: ResidentsProps) {
       try {
         setIsLoading(true);
         setLoadError(null);
-        const res = await apiFetch('/api/residents?includeArchived=true');
+        const [res, alertsRes] = await Promise.all([
+          apiFetch('/api/residents?includeArchived=true'),
+          apiFetch('/api/alerts')
+        ]);
         if (!res.ok) {
           throw new Error('Failed to fetch residents');
         }
         const data: BackendResident[] = await res.json();
-        const mapped = data.map((r, i) => normalizeResident({
-          id: `res-${r.id}`,
-          residentId: `RES-${1000 + Number(r.id)}`,
-          name: r.name,
-          age: computeAgeFromDob(r.date_of_birth),
-          gender: String(r.gender || '').trim()
-            ? String(r.gender).trim().slice(0, 1).toUpperCase() + String(r.gender).trim().slice(1)
-            : '',
-          room: r.room,
-          dob: r.date_of_birth || '',
-          status: r.status,
-          section: r.room.startsWith('A-') ? 'Wing A' : 'Wing B',
-          condition: '',
-          medicalConditions: parseMedicalConditions(r.medical_conditions),
-          allergies: r.allergies || '',
-          caregiver: r.caregiver_name || 'Unassigned',
-          profilePhoto: r.profile_photo ?? r.profilePhoto ?? null,
-          admittedDate: formatDateOnly(r.created_at) || formatPHDate(new Date()),
-          contacts: parseContacts(r.contacts),
-          heartRate: null,
-          battery: null,
-          deviceId: r.device_id || '',
-          archived: Boolean(r.archived),
-          colorIndex: i % AVATAR_COLORS.length,
-          medications: parseJsonArray(r.medications),
-          notes: [
-            { author: 'System', time: new Date(), content: 'Loaded from backend API.' },
-          ],
-          recentEvents: [],
-        }));
+        const allAlerts = alertsRes.ok ? await alertsRes.json() : [];
+        
+        const mapped = data.map((r, i) => {
+          const residentAlerts = allAlerts
+            .filter((a: any) => String(a.resident || '').trim().toLowerCase() === String(r.name || '').trim().toLowerCase())
+            .map((a: any) => ({
+              type: a.type || 'Unknown Incident',
+              severity: a.severity || 'info',
+              date: safeToLocaleString(a.timestamp),
+              outcome: a.status === 'resolved' ? 'Resolved' : a.status === 'acknowledged' ? 'Acknowledged' : 'Pending Action'
+            }));
+
+          return normalizeResident({
+            id: `res-${r.id}`,
+            residentId: `RES-${1000 + Number(r.id)}`,
+            name: r.name,
+            age: computeAgeFromDob(r.date_of_birth),
+            gender: String(r.gender || '').trim()
+              ? String(r.gender).trim().slice(0, 1).toUpperCase() + String(r.gender).trim().slice(1)
+              : '',
+            room: r.room,
+            dob: r.date_of_birth || '',
+            status: r.status,
+            section: r.room.startsWith('A-') ? 'Wing A' : 'Wing B',
+            condition: '',
+            medicalConditions: parseMedicalConditions(r.medical_conditions),
+            allergies: r.allergies || '',
+            caregiver: r.caregiver_name || 'Unassigned',
+            profilePhoto: r.profile_photo ?? r.profilePhoto ?? null,
+            admittedDate: formatDateOnly(r.created_at) || formatPHDate(new Date()),
+            contacts: parseContacts(r.contacts),
+            heartRate: null,
+            battery: null,
+            deviceId: r.device_id || '',
+            archived: Boolean(r.archived),
+            colorIndex: i % AVATAR_COLORS.length,
+            medications: parseJsonArray(r.medications),
+            notes: [
+              { author: 'System', time: new Date(), content: 'Loaded from backend API.' },
+            ],
+            recentEvents: residentAlerts,
+          });
+        });
         setResidents(mapped);
       } catch (_e) {
         setLoadError('Could not load residents from backend.');
@@ -345,9 +361,10 @@ export function Residents({ userRole }: ResidentsProps) {
   };
 
   return (
-    <div className="p-4 md:p-6">
-      {/* Header */}
-      <div className="flex items-center justify-between mb-5">
+    <div className="p-4 md:p-6 print:p-0">
+      <div className={showReport ? "print:hidden" : ""}>
+        {/* Header */}
+        <div className="flex items-center justify-between mb-5">
         <div>
           <h1 className="text-2xl font-bold text-slate-900">
             {userRole === 'caregiver' ? 'Assigned Residents' : 'Residents'}
@@ -442,6 +459,7 @@ export function Residents({ userRole }: ResidentsProps) {
             setConfirmArchive={setConfirmArchive}
             setResidentToRestore={setResidentToRestore}
             setResidentToPermanentDelete={setResidentToPermanentDelete}
+            onOpenReport={() => setShowReport(true)}
           />
         </ResidentProfileErrorBoundary>
       )}
@@ -457,6 +475,7 @@ export function Residents({ userRole }: ResidentsProps) {
           }}
         />
       )}
+      </div>
 
       {/* Archive Confirmation Dialog */}
       {confirmArchive && (
@@ -573,9 +592,9 @@ function ResidentDetailPanel({
   setConfirmArchive,
   setResidentToRestore,
   setResidentToPermanentDelete,
+  onOpenReport,
 }: any) {
   const [activeTab, setActiveTab] = useState('info');
-  const [showReport, setShowReport] = useState(false);
   const [photoError, setPhotoError] = useState('');
   const [photoBusy, setPhotoBusy] = useState(false);
   const [photoEditOpen, setPhotoEditOpen] = useState(false);
@@ -855,7 +874,7 @@ function ResidentDetailPanel({
   ];
 
   return (
-    <div className="fixed inset-0 z-50 flex">
+    <div className="fixed inset-0 z-50 flex print:hidden">
       <CropRotateModal
         title="Edit resident photo"
         open={photoEditOpen}
@@ -1353,7 +1372,7 @@ function ResidentDetailPanel({
                 </p>
               </div>
               <button
-                onClick={() => setShowReport(true)}
+                onClick={() => onOpenReport()}
                 className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-sm font-medium shadow-sm"
               >
                 <FileText className="w-4 h-4" />
@@ -1394,15 +1413,6 @@ function ResidentDetailPanel({
           </div>
         )}
       </div>
-
-      {/* Individual Resident Report Full-Screen Modal */}
-      {showReport && (
-        <ResidentReport
-          resident={resident}
-          userRole={userRole}
-          onClose={() => setShowReport(false)}
-        />
-      )}
     </div>
   );
 }
