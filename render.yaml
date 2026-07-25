@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: elderly-app
+    runtime: node
+    buildCommand: npm install && npm run build
+    startCommand: node server/index.js
+    plan: free
+    envVars:
+      - key: JWT_SECRET
+        value: 3c7dd8f6c9e44f15b1ad8e4e57f6a2f2c52b6d11dcd9440c9c3118c0af1a9f2f
+      - key: APP_ENV
+        value: production
+      - key: ALLOW_DEMO_SEED
+        value: true
+      - key: FIRST_ADMIN_BOOTSTRAP_KEY
+        value: facility-bootstrap-2026-secure-key
+      - key: UNISMS_API_SECRET
+        value: sk_1928a920-6553-41b4-af9c-ec1ff249eeaa
+      - key: FIREBASE_DATABASE_URL
+        value: https://safeband-feb1c-default-rtdb.firebaseio.com/
+      - key: FIREBASE_DB_SECRET
+        value: vsfV06qtgQdl1pZrLkN6iOqkot5ttQOoF4IWRsY5
+      - key: FIREBASE_RTDB_PREFIX
+        value: /safeband
+    disk:
+      name: elderly-app-data
+      mountPath: /app/server/data
+      sizeGB: 1
