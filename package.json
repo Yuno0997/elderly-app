@@ -76,6 +76,7 @@
     "dev:all": "concurrently \"npm run dev\" \"npm run dev:backend\"",
     "build": "vite build",
     "start": "node server/index.js",
+    "postinstall": "npm rebuild sqlite3 --build-from-source || true",
     "deploy:xampp": "powershell -ExecutionPolicy Bypass -File scripts/deploy-xampp.ps1",
     "tunnel:ngrok": "powershell -ExecutionPolicy Bypass -File scripts/write-ngrok-config.ps1 && tools/ngrok/ngrok.exe start --config=ngrok.generated.yml elderly-app",
     "sessions:kill-all": "node scripts/kill-all-sessions.js",
